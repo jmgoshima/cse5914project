@@ -125,7 +125,7 @@ _PROMPT = None
 
 if _LC_AVAILABLE:
     try:  # lazy, tolerate missing keys
-        _LLM = ChatOpenAI(
+        _LLM = ChatGoogleGenerativeAI(
             model=os.getenv("LC_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
             temperature=float(os.getenv("LC_TEMPERATURE", "0")),
             timeout=30,
