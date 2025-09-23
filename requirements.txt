@@ -1,0 +1,19 @@
+# Core runtime
+Flask>=2.2,<3
+pydantic>=2.0,<3
+
+# Data
+pandas>=1.5,<2
+
+# Elasticsearch client (8.x compatible)
+elasticsearch>=8.0.0,<9
+
+# LLM / OpenAI
+openai>=0.27.0
+
+# Optional: langchain if you plan to run end-to-end chains
+langchain>=0.0.300
+
+# Utilities / dev
+python-dotenv>=1.0.0
+pytest>=7.0.0
