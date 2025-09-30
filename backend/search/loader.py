@@ -1,6 +1,8 @@
 from elasticsearch import Elasticsearch, helpers
 from pathlib import Path
 import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 import os
 
 
@@ -8,6 +10,42 @@ import os
 
 # Load data as a dataframe
 df = pd.read_csv(Path(__file__).parent / "data" / "places.csv")
+
+# Remove CaseNum, Long, Lat, StNum
+df = df.drop(['CaseNum', 
+              'Long',
+              'Lat',
+              'StNum'],
+              axis = 1)
+
+df.hist()
+
+# Rescale values to a range from low_num to high_num
+low_num = 0
+high_num = 10
+
+# Select only numerical columns for scaling
+numerical_cols = df.select_dtypes(include=['number']).columns
+
+# Initialize Scalers
+min_max_scaler = MinMaxScaler((low_num, high_num))
+z_score_scaler = StandardScaler()
+
+# Apply Min-Max Scaling to numerical columns
+min_max_df = df.copy()
+min_max_df[numerical_cols] = min_max_scaler.fit_transform(df[numerical_cols])
+
+# Apply z-score normalization to numerical columns
+z_score_df = df.copy()
+z_score_df[numerical_cols] = z_score_scaler.fit_transform(df[numerical_cols])
+
+
+print(min_max_df.head(10))
+print(z_score_df.head(10))
+
+min_max_df.to_csv(Path(__file__).parent / "data" / "places_min_max.csv", index=False)
+z_score_df.to_csv(Path(__file__).parent / "data" / "places_z_score.csv", index=False)
+
 
 # 2. Loading data into elastic search
 
