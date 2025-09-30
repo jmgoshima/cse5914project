@@ -3,7 +3,7 @@ import os
 import json
 import re
 
-es = Elasticsearch("http://localhost:9200")
+es = Elasticsearch('http://localhost:9200', basic_auth=('elastic', 'QYzlf7wn'), verify_certs=False)
 index_name = "us_cities"
 
 # Example 1: Cities with HousingCost <= 6000, sorted by HlthCare descending
