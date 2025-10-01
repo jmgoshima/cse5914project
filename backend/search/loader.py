@@ -57,14 +57,47 @@ z_score_df.to_csv(Path(__file__).parent / "data" / "places_z_score.csv", index=F
 index_name = "us_cities"
 es = Elasticsearch('http://localhost:9200', basic_auth=('elastic', os.getenv("ES_LOCAL_PASSWORD")), verify_certs=False)
 
-# prepare bulk actions
-actions = [
-    {
-        "_index": index_name,
-        "_source": row.to_dict()
+# # prepare bulk actions
+# actions = [
+#     {
+#         "_index": index_name,
+#         "_source": row.to_dict()
+#     }
+#     for _, row in z_score_df.iterrows()
+# ]
+
+# Define mapping for the index
+dims = len(z_score_df.columns) - 1  # exclude "City" column
+mapping = {
+    "mappings": {
+        "properties": {
+            "city": {"type": "keyword"},
+            "review_vector": {"type": "dense_vector", "dims": dims}
+        }
     }
-    for _, row in z_score_df.iterrows()
-]
+}
+
+# delete existing index if it exists
+if es.indices.exists(index=index_name):
+    es.indices.delete(index=index_name)
+
+es.indices.create(index=index_name, body=mapping)
+
+# Prepare bulk actions
+actions = []
+for _, row in z_score_df.iterrows():
+    row_dict = row.to_dict()
+    city_name = row_dict.pop("City")  # remove "City" from vector fields
+    vector_values = list(row_dict.values())  # remaining numeric values
+
+    doc = {
+        "_index": index_name,
+        "_source": {
+            "city": city_name,
+            "review_vector": vector_values
+        }
+    }
+    actions.append(doc)
 
 # bulk insert
 helpers.bulk(es, actions)
