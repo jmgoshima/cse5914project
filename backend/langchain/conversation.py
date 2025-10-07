@@ -20,12 +20,19 @@ import re
 import json
 from typing import Optional
 
+# Load .env variables if present for local dev (e.g., GOOGLE_API_KEY)
+try:  # pragma: no cover
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:  # pragma: no cover
+    pass
+
 from .schemas import Profile
 
 # --- Optional LangChain imports (graceful fallback if missing) ------------
 _LC_AVAILABLE = True
 try:
-    from langchain_openai import ChatOpenAI
+    from langchain_google_genai import ChatGoogleGenerativeAI
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.output_parsers import PydanticOutputParser
 except Exception:  # pragma: no cover
@@ -51,6 +58,11 @@ def _merge_profiles(old: Profile, new: Profile) -> Profile:
                     seen.add(item)
                     result.append(item)
             return result
+        # Shallow-merge dictionaries (e.g., notes) so we don't lose history
+        if isinstance(v_old, dict) and isinstance(v_new, dict):
+            merged = dict(v_old)
+            merged.update(v_new)
+            return merged
         # Prefer v_new if it is truthy or explicitly False/0 (valid values)
         if v_new is not None:
             return v_new
@@ -113,6 +125,16 @@ def _heuristic_update(profile: Profile, message: str) -> Profile:
 
     # track message for traceability
     profile.notes.setdefault("turns", []).append(message)
+
+    # ensure a clarifying question when not ready
+    try:
+        if not is_profile_ready(profile):
+            if not profile.notes.get("next_question"):
+                nq = _default_next_question(profile)
+                if nq:
+                    profile.notes["next_question"] = nq
+    except Exception:
+        pass
     return profile
 
 
@@ -125,10 +147,10 @@ _PROMPT = None
 
 if _LC_AVAILABLE:
     try:  # lazy, tolerate missing keys
-        _LLM = ChatOpenAI(
-            model=os.getenv("LC_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
+        _LLM = ChatGoogleGenerativeAI(
+            model=os.getenv("LC_MODEL", os.getenv("GEMINI_MODEL", "gemini-1.5-flash")),
             temperature=float(os.getenv("LC_TEMPERATURE", "0")),
-            timeout=30,
+            max_output_tokens=int(os.getenv("LC_MAX_TOKENS", "1024")),
         )
         _PARSER = PydanticOutputParser(pydantic_object=Profile)
         _PROMPT = ChatPromptTemplate.from_messages([
@@ -143,6 +165,10 @@ Rules:
 - For list fields, append new values and avoid duplicates.
 - Be concise: do not invent details, use only what the user implies.
 - Output JSON only, no extra text.
+- When the profile is NOT ready, include a single clear clarifying question at notes.next_question.
+- When the profile IS ready, set notes.ready=true and omit notes.next_question.
+- Location rules: set hard_filters.country only when the user names a country (e.g., "United States"). Set hard_filters.state only when the user explicitly mentions a state by name; otherwise leave it null. Never guess states.
+ - Default scope: unless the user names a different country, assume the search is within the United States and set hard_filters.country = "United States".
 {format_instructions}
                 """.strip(),
             ),
@@ -166,6 +192,21 @@ def stepAgent(profile: Profile, message: str) -> Profile:
         return _heuristic_update(profile, message)
 
     # Prepare inputs
+    # Drop any stale follow-up question so each turn can propose a fresh one
+    try:
+        if isinstance(profile.notes, dict) and "next_question" in profile.notes:
+            profile.notes.pop("next_question", None)
+    except Exception:
+        pass
+
+    # Capture whether this is the first observed turn based on the incoming profile
+    has_prev_turns = False
+    try:
+        if isinstance(profile.notes, dict):
+            has_prev_turns = bool(profile.notes.get("turns"))
+    except Exception:
+        pass
+
     current_profile_json = profile.model_dump_json()
     format_instructions = _PARSER.get_format_instructions()
 
@@ -183,7 +224,14 @@ def stepAgent(profile: Profile, message: str) -> Profile:
 
     # Merge and return
     merged = _merge_profiles(profile, new_profile)
-    merged.notes.setdefault("turns", []).append(message)
+    # Ensure notes is a dict
+    if not isinstance(merged.notes, dict):
+        merged.notes = {}
+    # Apply lightweight heuristics to fill obvious fields the model may omit
+    _post_update_heuristics(merged, message, has_prev_turns)
+    turns = merged.notes.setdefault("turns", [])
+    if not turns or turns[-1] != message:
+        turns.append(message)
     # annotate readiness for callers (frontend or app.py can read this)
     try:
         ready = is_profile_ready(merged)
@@ -199,7 +247,107 @@ def stepAgent(profile: Profile, message: str) -> Profile:
                 "take": 5
             }
         }
+        # Remove any leftover clarifying question when ready
+        merged.notes.pop("next_question", None)
+    else:
+        # Ensure there is a clear next question; if the model omitted it, add a simple default.
+        if not merged.notes.get("next_question"):
+            nq = _default_next_question(merged)
+            if nq:
+                merged.notes["next_question"] = nq
     return merged
+
+
+def _post_update_heuristics(profile: Profile, message: str, has_prev_turns: bool) -> None:
+    """Best-effort fillers that do not overwrite confident values.
+
+    Runs after the LLM merge to improve robustness in local/dev runs.
+    """
+    m = (message or "").lower()
+
+    # Remote preference
+    if profile.wants_remote_friendly is None and any(tok in m for tok in ["remote", "work from home", "wfh"]):
+        profile.wants_remote_friendly = True
+
+    # Budget
+    if profile.budget_monthly_usd is None:
+        money = re.search(r"\$?\s*([0-9]{3,5}(?:,[0-9]{3})?)", m)
+        if money:
+            try:
+                amt = int(money.group(1).replace(",", ""))
+                if 300 <= amt <= 20000:
+                    profile.budget_monthly_usd = amt
+            except Exception:
+                pass
+
+    # Climate hints and normalization
+    if isinstance(profile.preferred_climates, list):
+        existing = {str(x).lower() for x in profile.preferred_climates}
+        def add_climate(label: str):
+            label = label.lower()
+            synonyms = {"warmer": "warm", "hot": "warm", "mild": "temperate"}
+            norm = synonyms.get(label, label)
+            if norm not in existing:
+                profile.preferred_climates.append(norm)
+                existing.add(norm)
+        if any(k in m for k in ["warm", "warmer", "hot", "sunny"]):
+            add_climate("warm")
+        if any(k in m for k in ["cold", "snow", "wintry"]):
+            add_climate("cold")
+        if any(k in m for k in ["mild", "temperate", "constant weather", "doesn't change", "doesnt change", "stable weather"]):
+            add_climate("temperate")
+
+    # Country / state extraction
+    hf = profile.hard_filters
+    # If hard_filters missing, initialize a dict-like via model default
+    if hf is None:
+        try:
+            from .schemas import HardFilters  # local import to avoid cycle
+            profile.hard_filters = HardFilters()
+            hf = profile.hard_filters
+        except Exception:
+            pass
+    try:
+        if hf is not None:
+            # Default to US unless user named a different country
+            if hf.country is None:
+                if any(k in m for k in ["united states", "usa", "u.s.", "us", "america", "u.s.a."]):
+                    hf.country = "United States"
+                else:
+                    # Default domain assumption per product: US cities
+                    hf.country = "United States"
+            # Simple state mapping
+            state_map = {
+                "ca": "California",
+                "california": "California",
+                "tx": "Texas",
+                "texas": "Texas",
+                "wa": "Washington",
+                "washington": "Washington",
+            }
+            for key, val in state_map.items():
+                if key in m:
+                    hf.state = hf.state or val
+                    break
+            # Avoid first-turn hallucinated state if user didn't mention any state tokens
+            if not has_prev_turns:
+                any_state_token = any(k in m for k in state_map.keys())
+                if hf.state and not any_state_token:
+                    hf.state = None
+    except Exception:
+        pass
+
+def _default_next_question(profile: Profile) -> Optional[str]:
+    """Fallback clarifying question when the model doesn't provide one."""
+    if profile.budget_monthly_usd is None:
+        return "What is your approximate monthly housing budget (in USD)?"
+    if not profile.preferred_climates:
+        return "Do you prefer a warm, mild/temperate, or cold climate?"
+    if not (profile.hard_filters and (profile.hard_filters.country or profile.hard_filters.state)):
+        return "Which country or state do you want to focus on?"
+    if not profile.commute_preference:
+        return "Do you prefer walkable areas, good transit, or driving?"
+    return "Any other must-haves (e.g., safety, schools, healthcare)?"
 
 
 # Optional readiness check the frontend can use (imported from here)
