@@ -9,16 +9,13 @@ Design goals
 - Structured output: the LLM returns a full `Profile` object (Pydantic) so we
   avoid brittle string parsing.
 - Safe merge: fields the model leaves as `null`/None keep their previous values.
-- Pluggable: model and temperature come from env vars; if LangChain/OpenAI
-  aren't available the code falls back to a tiny heuristic updater so local dev
-  still works.
+- Configurable: model and temperature come from environment variables; the
+  conversation logic always routes through the configured LLM.
 """
 from __future__ import annotations
 
 import os
-import re
-import json
-from typing import Optional
+from typing import Any, Dict, Optional, Callable, List
 
 # Load .env variables if present for local dev (e.g., GOOGLE_API_KEY)
 try:  # pragma: no cover
@@ -28,6 +25,43 @@ except Exception:  # pragma: no cover
     pass
 
 from .schemas import Profile
+
+METRIC_ORDER = [
+    "Climate",
+    "HousingCost",
+    "HlthCare",
+    "Crime",
+    "Transp",
+    "Educ",
+    "Arts",
+    "Recreat",
+    "Econ",
+    "Pop",
+]
+
+METRIC_QUESTIONS = {
+    "Climate": "Tell me about the climates you enjoy - are you picturing somewhere warm like Austin, mild like San Diego, or cooler like Seattle?",
+    "HousingCost": "How flexible is your housing budget? Are you hoping for very affordable places or okay paying more if everything else fits?",
+    "HlthCare": "How important is it for you to have strong healthcare and hospitals nearby?",
+    "Crime": "What level of day-to-day safety feels right for you - very quiet neighborhoods or is some urban energy okay?",
+    "Transp": "How do you like to get around in a new city - reliable transit, walkable streets, or mostly driving yourself?",
+    "Educ": "Do good schools or education resources play a big role in your move?",
+    "Arts": "How much do arts and cultural scenes (museums, music, festivals) matter to you?",
+    "Recreat": "How important are outdoor activities or recreation options like parks, hiking, or beaches?",
+    "Econ": "Tell me about the job market or economic strength you're looking for - does it need to be booming or just stable?",
+    "Pop": "Do you gravitate toward small towns, midsize cities, or big metros? Any specific places come to mind?",
+}
+
+def _all_metrics_set(profile: Profile) -> bool:
+    return all(getattr(profile, metric) is not None for metric in METRIC_ORDER)
+
+
+def _record_turn(notes: Dict[str, Any], message: str) -> None:
+    turns = notes.setdefault("turns", []) if isinstance(notes, dict) else None
+    if isinstance(turns, list) and (not turns or turns[-1] != message):
+        turns.append(message)
+
+
 
 # --- Optional LangChain imports (graceful fallback if missing) ------------
 _LC_AVAILABLE = True
@@ -42,106 +76,25 @@ except Exception:  # pragma: no cover
 # -------------------- Utility: merge profiles -----------------------------
 
 def _merge_profiles(old: Profile, new: Profile) -> Profile:
-    """Merge `new` into `old`, preferring `new` when it's not None/empty.
+    """Prefer values from `new`, falling back to `old` when empty."""
+    merged = Profile(**old.model_dump())
 
-    Lists are merged (de-duplicated, preserving order), scalars use `new` if set.
-    """
-    data_old = old.model_dump()
-    data_new = new.model_dump()
+    for metric in METRIC_ORDER:
+        value = getattr(new, metric, None)
+        if value is not None:
+            setattr(merged, metric, value)
 
-    def _merge_value(k: str, v_old, v_new):
-        if isinstance(v_old, list) and isinstance(v_new, list):
-            seen = set()
-            result = []
-            for item in list(v_old) + list(v_new):
-                if item not in seen:
-                    seen.add(item)
-                    result.append(item)
-            return result
-        # Shallow-merge dictionaries (e.g., notes) so we don't lose history
-        if isinstance(v_old, dict) and isinstance(v_new, dict):
-            merged = dict(v_old)
-            merged.update(v_new)
-            return merged
-        # Prefer v_new if it is truthy or explicitly False/0 (valid values)
-        if v_new is not None:
-            return v_new
-        return v_old
-
-    merged = {k: _merge_value(k, data_old.get(k), data_new.get(k)) for k in data_old.keys()}
-    return Profile(**merged)
-
-
-# -------------------- Heuristic fallback (no LLM) -------------------------
-
-def _heuristic_update(profile: Profile, message: str) -> Profile:
-    """Very small rule-based updater used when LLM isn't configured.
-    This keeps local dev unblocked.
-    """
-    m = message.lower()
-
-    # remote-friendly
-    if any(tok in m for tok in ["remote", "work from home", "wfh"]):
-        profile.wants_remote_friendly = True
-
-    # climates
-    climate_keywords = {
-        "warm": "warm",
-        "sunny": "warm",
-        "beach": "mediterranean",
-        "mediterranean": "mediterranean",
-        "cold": "cold",
-        "snow": "cold",
-        "temperate": "temperate",
-        "tropical": "tropical",
-    }
-    for k, label in climate_keywords.items():
-        if k in m and label not in profile.preferred_climates:
-            profile.preferred_climates.append(label)
-
-    # industry
-    if "tech" in m or "software" in m:
-        profile.industry = profile.industry or "technology"
-    if "finance" in m and profile.industry is None:
-        profile.industry = "finance"
-
-    # commute preference
-    if any(w in m for w in ["walkable", "walkability", "walk"]):
-        profile.commute_preference = "walkable"
-    elif "transit" in m or "subway" in m:
-        profile.commute_preference = "transit"
-    elif "car" in m or "drive" in m:
-        profile.commute_preference = "car"
-
-    # budget extraction like: "$2,500", "2500", "budget 1800"
-    money = re.search(r"\$?\s*([0-9]{3,5}(?:,[0-9]{3})?)", m)
-    if money and profile.budget_monthly_usd is None:
-        try:
-            amt = int(money.group(1).replace(",", ""))
-            if 300 <= amt <= 20000:
-                profile.budget_monthly_usd = amt
-        except Exception:
-            pass
-
-    # track message for traceability
-    profile.notes.setdefault("turns", []).append(message)
-
-    # ensure a clarifying question when not ready
-    try:
-        if not is_profile_ready(profile):
-            if not profile.notes.get("next_question"):
-                nq = _default_next_question(profile)
-                if nq:
-                    profile.notes["next_question"] = nq
-    except Exception:
-        pass
-    return profile
+    old_notes = old.notes if isinstance(old.notes, dict) else {}
+    new_notes = new.notes if isinstance(new.notes, dict) else {}
+    merged.notes = {**old_notes, **new_notes}
+    return merged
 
 
 # -------------------- LLM-powered updater ---------------------------------
 
 # Build LLM objects at import time (once per process). If unavailable, we keep None.
 _LLM = None
+_BASE_PARSER = None
 _PARSER = None
 _PROMPT = None
 
@@ -152,23 +105,29 @@ if _LC_AVAILABLE:
             temperature=float(os.getenv("LC_TEMPERATURE", "0")),
             max_output_tokens=int(os.getenv("LC_MAX_TOKENS", "1024")),
         )
-        _PARSER = PydanticOutputParser(pydantic_object=Profile)
+        from langchain.output_parsers import OutputFixingParser
+
+        _BASE_PARSER = PydanticOutputParser(pydantic_object=Profile)
+        _PARSER = OutputFixingParser.from_llm(llm=_LLM, parser=_BASE_PARSER)
         _PROMPT = ChatPromptTemplate.from_messages([
             (
                 "system",
                 """
-You are a relocation profile builder. Given the CURRENT_PROFILE (a JSON object) and the latest USER_MESSAGE, produce a COMPLETE Profile JSON that best reflects the user's preferences.
-Ask clarifying questions across turns until you are at least 85% confident in the profile. When you are confident, do not ask more questions—just update the JSON.
-Rules:
-- Only change fields you are confident about based on the USER_MESSAGE.
-- Keep unspecified fields the same as CURRENT_PROFILE.
-- For list fields, append new values and avoid duplicates.
-- Be concise: do not invent details, use only what the user implies.
-- Output JSON only, no extra text.
-- When the profile is NOT ready, include a single clear clarifying question at notes.next_question.
-- When the profile IS ready, set notes.ready=true and omit notes.next_question.
-- Location rules: set hard_filters.country only when the user names a country (e.g., "United States"). Set hard_filters.state only when the user explicitly mentions a state by name; otherwise leave it null. Never guess states.
- - Default scope: unless the user names a different country, assume the search is within the United States and set hard_filters.country = "United States".
+You score relocation preferences using a 10-value profile vector with these keys in order:
+Climate, HousingCost, HlthCare, Crime, Transp, Educ, Arts, Recreat, Econ, Pop.
+Every value must be a float between 0 and 10 (inclusive). Higher numbers mean a stronger preference or better fit for that attribute.
+
+Guidance:
+- Output JSON only, matching the Profile schema. Do not add prose around it.
+- Carry forward existing scores from CURRENT_PROFILE unless the USER_MESSAGE gives new evidence.
+- Ask clarifying questions in natural language (e.g., "Which cities have the vibe you like?" or "Do you lean toward warmer weather?"). Prefer stories, examples, and qualitative answers.
+- Infer 0-10 scores from the conversation: translate qualitative cues into numbers (e.g., "very important" ~ 9, "I don't care" ~ 2, "I love hot weather" ~ 8). Only request an explicit number if the user volunteers it or it is absolutely necessary.
+- Maintain notes.turns as an array and append the latest USER_MESSAGE if it is missing.
+- When any metric is still uncertain, set notes.ready=false and place ONE conversational follow-up question about the most uncertain metric into notes.next_question. The question should sound natural (no scale references).
+- When every metric is confidently filled, set notes.ready=true and remove notes.next_question.
+- Never mention external tools or searching; you only build the profile.
+
+Be precise and deterministic.
 {format_instructions}
                 """.strip(),
             ),
@@ -176,20 +135,18 @@ Rules:
         ])
     except Exception:
         _LLM = None
+        _BASE_PARSER = None
         _PARSER = None
         _PROMPT = None
 
 
 def stepAgent(profile: Profile, message: str) -> Profile:
-    """Single turn of the conversation: update and return the Profile.
-
-    If LangChain + an LLM are configured, we use structured output to produce a
-    full Profile and then merge it with the incoming one. Otherwise, we fall
-    back to a small heuristic updater.
-    """
-    # If LLM isn't available, use heuristics
+    """Single turn of the conversation driven entirely by the configured LLM."""
     if not (_LLM and _PARSER and _PROMPT):
-        return _heuristic_update(profile, message)
+        raise RuntimeError(
+            "LangChain conversation agent requires a configured LLM. "
+            "Set GOOGLE_API_KEY / GEMINI credentials before running the CLI."
+        )
 
     # Prepare inputs
     # Drop any stale follow-up question so each turn can propose a fresh one
@@ -199,58 +156,32 @@ def stepAgent(profile: Profile, message: str) -> Profile:
     except Exception:
         pass
 
-    # Capture whether this is the first observed turn based on the incoming profile
-    has_prev_turns = False
-    try:
-        if isinstance(profile.notes, dict):
-            has_prev_turns = bool(profile.notes.get("turns"))
-    except Exception:
-        pass
-
     current_profile_json = profile.model_dump_json()
-    format_instructions = _PARSER.get_format_instructions()
+    if not _BASE_PARSER:
+        raise RuntimeError("LLM parser is not initialized")
+
+    format_instructions = _BASE_PARSER.get_format_instructions()
 
     # Run chain: prompt → llm → parse
-    try:
-        chain = _PROMPT | _LLM | _PARSER
-        new_profile: Profile = chain.invoke({
-            "current_profile": current_profile_json,
-            "user_message": message,
-            "format_instructions": format_instructions,
-        })
-    except Exception:
-        # If anything goes wrong, gracefully fall back
-        return _heuristic_update(profile, message)
+    chain = _PROMPT | _LLM | _PARSER
+    new_profile: Profile = chain.invoke({
+        "current_profile": current_profile_json,
+        "user_message": message,
+        "format_instructions": format_instructions,
+    })
 
     # Merge and return
     merged = _merge_profiles(profile, new_profile)
     # Ensure notes is a dict
     if not isinstance(merged.notes, dict):
         merged.notes = {}
-    # Apply lightweight heuristics to fill obvious fields the model may omit
-    _post_update_heuristics(merged, message, has_prev_turns)
-    turns = merged.notes.setdefault("turns", [])
-    if not turns or turns[-1] != message:
-        turns.append(message)
-    # annotate readiness for callers (frontend or app.py can read this)
-    try:
-        ready = is_profile_ready(merged)
-    except Exception:
-        ready = False
+    _record_turn(merged.notes, message)
+
+    ready = _all_metrics_set(merged)
     merged.notes["ready"] = ready
     if ready:
-        # Suggest next action for the orchestrator. Do not perform the search here.
-        merged.notes["next_action"] = {
-            "type": "search_places",   # app.py can use this to call /recommend or /search/places
-            "params": {
-                "topK": 20,
-                "take": 5
-            }
-        }
-        # Remove any leftover clarifying question when ready
         merged.notes.pop("next_question", None)
     else:
-        # Ensure there is a clear next question; if the model omitted it, add a simple default.
         if not merged.notes.get("next_question"):
             nq = _default_next_question(merged)
             if nq:
@@ -258,114 +189,23 @@ def stepAgent(profile: Profile, message: str) -> Profile:
     return merged
 
 
-def _post_update_heuristics(profile: Profile, message: str, has_prev_turns: bool) -> None:
-    """Best-effort fillers that do not overwrite confident values.
-
-    Runs after the LLM merge to improve robustness in local/dev runs.
-    """
-    m = (message or "").lower()
-
-    # Remote preference
-    if profile.wants_remote_friendly is None and any(tok in m for tok in ["remote", "work from home", "wfh"]):
-        profile.wants_remote_friendly = True
-
-    # Budget
-    if profile.budget_monthly_usd is None:
-        money = re.search(r"\$?\s*([0-9]{3,5}(?:,[0-9]{3})?)", m)
-        if money:
-            try:
-                amt = int(money.group(1).replace(",", ""))
-                if 300 <= amt <= 20000:
-                    profile.budget_monthly_usd = amt
-            except Exception:
-                pass
-
-    # Climate hints and normalization
-    if isinstance(profile.preferred_climates, list):
-        existing = {str(x).lower() for x in profile.preferred_climates}
-        def add_climate(label: str):
-            label = label.lower()
-            synonyms = {"warmer": "warm", "hot": "warm", "mild": "temperate"}
-            norm = synonyms.get(label, label)
-            if norm not in existing:
-                profile.preferred_climates.append(norm)
-                existing.add(norm)
-        if any(k in m for k in ["warm", "warmer", "hot", "sunny"]):
-            add_climate("warm")
-        if any(k in m for k in ["cold", "snow", "wintry"]):
-            add_climate("cold")
-        if any(k in m for k in ["mild", "temperate", "constant weather", "doesn't change", "doesnt change", "stable weather"]):
-            add_climate("temperate")
-
-    # Country / state extraction
-    hf = profile.hard_filters
-    # If hard_filters missing, initialize a dict-like via model default
-    if hf is None:
-        try:
-            from .schemas import HardFilters  # local import to avoid cycle
-            profile.hard_filters = HardFilters()
-            hf = profile.hard_filters
-        except Exception:
-            pass
-    try:
-        if hf is not None:
-            # Default to US unless user named a different country
-            if hf.country is None:
-                if any(k in m for k in ["united states", "usa", "u.s.", "us", "america", "u.s.a."]):
-                    hf.country = "United States"
-                else:
-                    # Default domain assumption per product: US cities
-                    hf.country = "United States"
-            # Simple state mapping
-            state_map = {
-                "ca": "California",
-                "california": "California",
-                "tx": "Texas",
-                "texas": "Texas",
-                "wa": "Washington",
-                "washington": "Washington",
-            }
-            for key, val in state_map.items():
-                if key in m:
-                    hf.state = hf.state or val
-                    break
-            # Avoid first-turn hallucinated state if user didn't mention any state tokens
-            if not has_prev_turns:
-                any_state_token = any(k in m for k in state_map.keys())
-                if hf.state and not any_state_token:
-                    hf.state = None
-    except Exception:
-        pass
-
 def _default_next_question(profile: Profile) -> Optional[str]:
-    """Fallback clarifying question when the model doesn't provide one."""
-    if profile.budget_monthly_usd is None:
-        return "What is your approximate monthly housing budget (in USD)?"
-    if not profile.preferred_climates:
-        return "Do you prefer a warm, mild/temperate, or cold climate?"
-    if not (profile.hard_filters and (profile.hard_filters.country or profile.hard_filters.state)):
-        return "Which country or state do you want to focus on?"
-    if not profile.commute_preference:
-        return "Do you prefer walkable areas, good transit, or driving?"
-    return "Any other must-haves (e.g., safety, schools, healthcare)?"
+    """Ask for the first metric that is still unset."""
+    for metric in METRIC_ORDER:
+        if getattr(profile, metric) is None:
+            return METRIC_QUESTIONS.get(metric)
+    return None
 
 
 # Optional readiness check the frontend can use (imported from here)
 
 def is_profile_ready(profile: Profile) -> bool:
-    """Define your own readiness criteria for moving on to search/recommend.
-    Example heuristic: budget, at least one climate preference, and either
-    industry or remote preference.
-    """
-    has_budget = profile.budget_monthly_usd is not None
-    has_climate = bool(profile.preferred_climates)
-    has_work = bool(profile.industry) or bool(profile.wants_remote_friendly)
-    return has_budget and has_climate and has_work
+    """Ready when every metric has a numeric value."""
+    return _all_metrics_set(profile)
 
 
 # Optional helper: allow caller to inject a callback that runs search/recommend
 # without this module importing ES directly.
-from typing import Callable, Dict, Any
 
 def stepAgent_with_callback(profile: Profile, message: str, on_ready: Callable[[Profile], Dict[str, Any]]):
     """Run stepAgent; if the profile becomes ready, call `on_ready(profile)` and
@@ -375,7 +215,7 @@ def stepAgent_with_callback(profile: Profile, message: str, on_ready: Callable[[
     updated = stepAgent(profile, message)
     result: Dict[str, Any] = {"profile": updated}
     try:
-        if updated.notes.get("ready"):
+        if isinstance(updated.notes, dict) and updated.notes.get("ready"):
             result["on_ready_result"] = on_ready(updated)
     except Exception:
         # If callback fails, still return the profile

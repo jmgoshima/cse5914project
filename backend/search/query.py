@@ -1,95 +1,126 @@
-from elasticsearch import Elasticsearch, helpers
-import os
+from __future__ import annotations
+
+import argparse
 import json
-import re
+import os
+import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 from dotenv import load_dotenv
+from elasticsearch import Elasticsearch
 
-env_path_relative = Path(__file__).parent.parent.parent / "elastic-start-local" / ".env"
-load_dotenv(dotenv_path=env_path_relative)
+# Load environment for local Elastic credentials if present
+ENV_PATH = Path(__file__).parent.parent.parent / "elastic-start-local" / ".env"
+if ENV_PATH.exists():
+    load_dotenv(dotenv_path=ENV_PATH)
 
-es = Elasticsearch('http://localhost:9200', basic_auth=('elastic', os.getenv("ES_LOCAL_PASSWORD")), verify_certs=False)
-index_name = "us_cities"
+INDEX_NAME = os.getenv("ES_INDEX_NAME", "us_cities")
+ES_URL = os.getenv("ES_URL", "http://localhost:9200")
+ES_USERNAME = os.getenv("ES_USERNAME", "elastic")
+ES_PASSWORD = os.getenv("ES_PASSWORD", os.getenv("ES_LOCAL_PASSWORD"))
 
-city_to_search = "Random City"
+# Keep the metric order aligned with the LLM profile schema
+PROFILE_METRICS: List[str] = [
+    "Climate",
+    "HousingCost",
+    "HlthCare",
+    "Crime",
+    "Transp",
+    "Educ",
+    "Arts",
+    "Recreat",
+    "Econ",
+    "Pop",
+]
 
-# # Fetch the city’s vector from ES
-# city_doc = es.search(
-#     index=index_name,
-#     query={"term": {"city": city_to_search}},
-#     size=1
-# )
+_es_client: Optional[Elasticsearch] = None
 
-# if not city_doc["hits"]["hits"]:
-#     raise ValueError(f"City '{city_to_search}' not found in index '{index_name}'.")
 
-# query_vector = city_doc["hits"]["hits"][0]["_source"]["review_vector"]
+def _get_client() -> Elasticsearch:
+    global _es_client
+    if _es_client is None:
+        auth = None
+        if ES_USERNAME and ES_PASSWORD:
+            auth = (ES_USERNAME, ES_PASSWORD)
+        _es_client = Elasticsearch(
+            ES_URL,
+            basic_auth=auth,
+            verify_certs=False,
+            request_timeout=30,
+        )
+    return _es_client
 
-def get_query_vector(json_path):
-    with open(json_path, "r") as f:
-        data = json.load(f)
-    
-    # Convert to dict if it's a list of objects
-    if isinstance(data, list):
-        if len(data) != 1:
-            raise ValueError("JSON file must contain exactly one record when used as a query vector.")
-        data = data[0]
-    
-    vector = [float(v) for v in data.values()]
+
+def search_for_profile(
+    vector: List[float],
+    *,
+    k: int = 5,
+    num_candidates: Optional[int] = None,
+    index: str = INDEX_NAME,
+) -> Dict[str, Any]:
+    """Run a kNN search for the provided profile vector."""
+    if not vector:
+        raise ValueError("Profile vector must contain at least one value.")
+
+    client = _get_client()
+    knn_body: Dict[str, Any] = {
+        "field": "review_vector",
+        "query_vector": vector,
+        "k": k,
+    }
+    if num_candidates is not None:
+        knn_body["num_candidates"] = num_candidates
+
+    response = client.search(index=index, knn=knn_body)
+    return response
+
+
+def _load_vector_from_json(path: Path) -> List[float]:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    if isinstance(payload, list):
+        vector = [float(v) for v in payload]
+    elif isinstance(payload, dict):
+        vector = []
+        for key in PROFILE_METRICS:
+            if key not in payload:
+                raise ValueError(f"Missing '{key}' in profile JSON.")
+            vector.append(float(payload[key]))
+    else:
+        raise ValueError("Profile JSON must be either a list of floats or an object with metric keys.")
+
     return vector
 
-query_vector = get_query_vector("data/test_city.json")
+
+def _cli() -> None:
+    parser = argparse.ArgumentParser(description="Run an Elasticsearch kNN search using a profile vector.")
+    parser.add_argument("vector", help="Path to a JSON file containing the profile vector.")
+    parser.add_argument("--top-k", type=int, default=5, help="Number of nearest neighbours to return.")
+    parser.add_argument(
+        "--num-candidates",
+        type=int,
+        default=None,
+        help="Optional num_candidates override for Elasticsearch kNN search.",
+    )
+    parser.add_argument(
+        "--index",
+        default=INDEX_NAME,
+        help=f"Elasticsearch index name (default: {INDEX_NAME}).",
+    )
+    args = parser.parse_args()
+
+    vector = _load_vector_from_json(Path(args.vector))
+    response = search_for_profile(
+        vector,
+        k=args.top_k,
+        num_candidates=args.num_candidates,
+        index=args.index,
+    )
+    json.dump(response, sys.stdout, indent=2)
+    sys.stdout.write("\n")
 
 
-# Run kNN to find similar cities
-response = es.search(
-    index=index_name,
-    knn={
-        "field": "review_vector",
-        "query_vector": query_vector,
-        "k": 5,               # how many nearest neighbors
-        "num_candidates": 50  # search depth
-    }
-)
-
-# Print results (excluding the city itself)
-print(f"Nearest neighbors to {city_to_search}:")
-for hit in response["hits"]["hits"]:
-    city = hit["_source"]["city"]
-    score = hit["_score"]
-    if city != city_to_search:   # skip the same city
-        print(f"  {city:20}  (score={score:.4f})")
-
-# # Example 1: Cities with HousingCost <= 6000, sorted by HlthCare descending
-# query = {
-#     "query": {
-#         "range": {
-#             "HousingCost": {"lte": 6000}
-#         }
-#     },
-#     "sort": [{"HlthCare": "desc"}]
-# }
-
-# results = es.search(index=index_name, body=query)
-
-# print("Cities with HousingCost <= 6000 sorted by HlthCare:")
-# for hit in results['hits']['hits']:
-#     src = hit['_source']
-#     print(f"{src['City']}: HousingCost={src['HousingCost']} HlthCare={src['HlthCare']}")
-
-# # Example 2: Average HlthCare by Climate
-# agg_query = {
-#     "size": 0,
-#     "aggs": {
-#         "avg_hlthcare_by_climate": {
-#             "terms": {"field": "Climate"},
-#             "aggs": {"avg_hlthcare": {"avg": {"field": "HlthCare"}}}
-#         }
-#     }
-# }
-
-# agg_results = es.search(index=index_name, body=agg_query)
-
-# print("\nAverage HlthCare by Climate:")
-# for bucket in agg_results['aggregations']['avg_hlthcare_by_climate']['buckets']:
-#     print(f"Climate {bucket['key']}: Avg HlthCare={bucket['avg_hlthcare']['value']:.2f}")
+if __name__ == "__main__":
+    _cli()

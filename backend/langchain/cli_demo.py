@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-CLI demo to run the conversation agent locally without Elasticsearch.
+CLI demo to run the conversation agent locally and fetch search results from Elasticsearch.
 
 Usage examples:
 
@@ -23,15 +23,11 @@ Environment:
 import argparse
 import json
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from backend.langchain.schemas import Profile
-from backend.langchain.conversation import (
-    stepAgent,
-    stepAgent_with_callback,
-    is_profile_ready,
-)
-from backend.langchain.explain import explain
+from backend.langchain.conversation import stepAgent_with_callback
+from backend.search.query import search_for_profile, PROFILE_METRICS
 
 # Best-effort check to report whether LLM is wired up (optional)
 try:  # type: ignore[attr-defined]
@@ -49,66 +45,43 @@ def _pretty(obj: Any) -> str:
         return str(obj)
 
 
-USE_LLM_REASONS: bool = False
+SEARCH_TOP_K: int = 5
+SEARCH_NUM_CANDIDATES: Optional[int] = None
 
 
-def mock_on_ready(profile: Profile) -> Dict[str, Any]:
-    """Return a fake search result; avoids any ES dependency."""
-    # You can tailor the mock using simple heuristics from the profile
-    warm = "warm" in (profile.preferred_climates or [])
-    remote = bool(profile.wants_remote_friendly)
-    budget = profile.budget_monthly_usd or 0
+def _profile_to_vector(profile: Profile) -> List[float]:
+    vector: List[float] = []
+    for metric in PROFILE_METRICS:
+        value = getattr(profile, metric, None)
+        if value is None:
+            raise ValueError(f"Profile is missing a value for '{metric}'.")
+        vector.append(float(value))
+    return vector
 
-    cities: List[Dict[str, Any]] = []
-    if warm:
-        cities.append({
-            "id": "1",
-            "name": "Austin, TX",
-            "score": 1.0,
-            "reason": None,
-        })
-        cities.append({
-            "id": "2",
-            "name": "San Diego, CA",
-            "score": 0.9,
-            "reason": None,
-        })
-    else:
-        cities.append({
-            "id": "3",
-            "name": "Seattle, WA",
-            "score": 0.85,
-            "reason": None,
-        })
 
-    # Filter mock by budget very loosely (purely illustrative)
-    if budget and budget < 2000:
-        cities = [c for c in cities if "Austin" in c["name"]]
+def _search_on_ready(profile: Profile) -> Dict[str, Any]:
+    try:
+        vector = _profile_to_vector(profile)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
-    # Optionally generate LLM reasons
-    if USE_LLM_REASONS:
-        for c in cities:
-            try:
-                prompt = (
-                    "You are a relocation advisor. In 2–4 sentences, explain why this city fits the user's preferences. "
-                    "Reference cost of living, climate, safety, job market, and lifestyle if available. "
-                    "No markdown, no lists.\n\n"
-                    f"USER_PROFILE_JSON:\n{profile.model_dump_json()}\n\nCITY_NAME:\n{c['name']}\n\nREASON:"
-                )
-                c["reason"] = explain(prompt).strip()
-            except Exception:
-                c["reason"] = c.get("reason") or "(reason unavailable)"
+    try:
+        return search_for_profile(
+            vector,
+            k=SEARCH_TOP_K,
+            num_candidates=SEARCH_NUM_CANDIDATES,
+        )
+    except Exception as exc:
+        return {"error": f"Search failed: {exc}"}
 
-    return {
-        "count": len(cities),
-        "cities": cities,
-        "raw_query": {"mock": True},
-        "notes": {
-            "llm_mode": bool(_AGENT_LLM),
-            "remote": remote,
-            "budget": budget,
-        }
-    }
+
+def _require_llm() -> bool:
+    if _AGENT_LLM:
+        return True
+    print(
+        "LLM not configured. Set GOOGLE_API_KEY (or GEMINI credentials) before running the CLI."
+    )
+    return False
 
 
 def run_messages(messages: List[str], start_profile_path: str | None, keep_going: bool) -> int:
@@ -122,10 +95,17 @@ def run_messages(messages: List[str], start_profile_path: str | None, keep_going
             print(f"Failed to load start profile from {start_profile_path}: {exc}")
             return 2
 
-    print(f"Agent mode: {'LLM' if _AGENT_LLM else 'Heuristic'}\n")
+    if not _require_llm():
+        return 2
+
+    print("Agent mode: LLM\n")
 
     for i, msg in enumerate(messages, 1):
-        out = stepAgent_with_callback(profile, msg, on_ready=mock_on_ready)
+        try:
+            out = stepAgent_with_callback(profile, msg, on_ready=_search_on_ready)
+        except RuntimeError as err:
+            print(f"Agent error: {err}")
+            return 2
         profile = out["profile"]
 
         print(f"Turn {i} - User: {msg}")
@@ -143,8 +123,13 @@ def run_messages(messages: List[str], start_profile_path: str | None, keep_going
             pass
 
         if profile.notes.get("ready"):
-            print("\nProfile ready. Mock recommendations:")
-            print(_pretty(out.get("on_ready_result", {})))
+            result = out.get("on_ready_result", {})
+            if isinstance(result, dict) and result.get("error"):
+                print("\nSearch error:")
+                print(result["error"])
+            else:
+                print("\nProfile ready. Search results:")
+                print(_pretty(result))
             if not keep_going:
                 return 0
 
@@ -164,8 +149,11 @@ def run_interactive(start_profile_path: str | None) -> int:
             print(f"Failed to load start profile from {start_profile_path}: {exc}")
             return 2
 
+    if not _require_llm():
+        return 2
+
     print("Conversation agent demo (type 'exit' to quit).")
-    print(f"Agent mode: {'LLM' if _AGENT_LLM else 'Heuristic'}\n")
+    print("Agent mode: LLM\n")
 
     turn = 0
     while True:
@@ -179,7 +167,11 @@ def run_interactive(start_profile_path: str | None) -> int:
             return 0
 
         turn += 1
-        out = stepAgent_with_callback(profile, msg, on_ready=mock_on_ready)
+        try:
+            out = stepAgent_with_callback(profile, msg, on_ready=_search_on_ready)
+        except RuntimeError as err:
+            print(f"Agent error: {err}")
+            return 2
         profile = out["profile"]
 
         print("Updated Profile:")
@@ -196,14 +188,19 @@ def run_interactive(start_profile_path: str | None) -> int:
             pass
 
         if profile.notes.get("ready"):
-            print("\nProfile ready. Mock recommendations:")
-            print(_pretty(out.get("on_ready_result", {})))
+            result = out.get("on_ready_result", {})
+            if isinstance(result, dict) and result.get("error"):
+                print("\nSearch error:")
+                print(result["error"])
+            else:
+                print("\nProfile ready. Search results:")
+                print(_pretty(result))
             print("\nType more to refine further, or 'exit' to quit.")
         print("---")
 
 
 def main(argv: List[str]) -> int:
-    parser = argparse.ArgumentParser(description="Run the conversation agent locally (no ES), with mock recommendations.")
+    parser = argparse.ArgumentParser(description="Run the conversation agent locally and fetch Elasticsearch recommendations.")
     parser.add_argument(
         "-m", "--message", dest="messages", action="append", default=[],
         help="Provide a user message (repeatable for multi-turn). If omitted, runs interactive mode.",
@@ -217,14 +214,23 @@ def main(argv: List[str]) -> int:
         help="Do not exit when the profile becomes ready; continue processing messages.",
     )
     parser.add_argument(
-        "--llm-reasons", action="store_true",
-        help="Use the LLM to generate reasons for mock results (requires API key).",
+        "--top-k",
+        type=int,
+        default=5,
+        help="Number of nearest neighbours to request from Elasticsearch (default: 5).",
+    )
+    parser.add_argument(
+        "--num-candidates",
+        type=int,
+        default=None,
+        help="Optional Elasticsearch num_candidates override for kNN search.",
     )
 
     args = parser.parse_args(argv)
 
-    global USE_LLM_REASONS
-    USE_LLM_REASONS = bool(args.llm_reasons)
+    global SEARCH_TOP_K, SEARCH_NUM_CANDIDATES
+    SEARCH_TOP_K = max(1, args.top_k)
+    SEARCH_NUM_CANDIDATES = args.num_candidates if args.num_candidates is None else max(args.num_candidates, args.top_k)
 
     if args.messages:
         return run_messages(args.messages, args.start_profile, keep_going=args.keep_going)
