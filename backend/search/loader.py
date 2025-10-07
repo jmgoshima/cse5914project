@@ -34,22 +34,22 @@ numerical_cols = df.select_dtypes(include=['number']).columns
 
 # Initialize Scalers
 min_max_scaler = MinMaxScaler((low_num, high_num))
-z_score_scaler = StandardScaler()
+# z_score_scaler = StandardScaler()
 
 # Apply Min-Max Scaling to numerical columns
 min_max_df = df.copy()
 min_max_df[numerical_cols] = min_max_scaler.fit_transform(df[numerical_cols])
 
 # Apply z-score normalization to numerical columns
-z_score_df = df.copy()
-z_score_df[numerical_cols] = z_score_scaler.fit_transform(df[numerical_cols])
+# z_score_df = df.copy()
+# z_score_df[numerical_cols] = z_score_scaler.fit_transform(df[numerical_cols])
 
 
 print(min_max_df.head(10))
-print(z_score_df.head(10))
+# print(z_score_df.head(10))
 
 min_max_df.to_csv(Path(__file__).parent / "data" / "places_min_max.csv", index=False)
-z_score_df.to_csv(Path(__file__).parent / "data" / "places_z_score.csv", index=False)
+# z_score_df.to_csv(Path(__file__).parent / "data" / "places_z_score.csv", index=False)
 
 
 # 2. Loading data into elastic search
@@ -67,7 +67,7 @@ es = Elasticsearch('http://localhost:9200', basic_auth=('elastic', os.getenv("ES
 # ]
 
 # Define mapping for the index
-dims = len(z_score_df.columns) - 1  # exclude "City" column
+dims = len(min_max_df.columns) - 1  # exclude "City" column
 mapping = {
     "mappings": {
         "properties": {
@@ -85,7 +85,7 @@ es.indices.create(index=index_name, body=mapping)
 
 # Prepare bulk actions
 actions = []
-for _, row in z_score_df.iterrows():
+for _, row in min_max_df.iterrows():
     row_dict = row.to_dict()
     city_name = row_dict.pop("City")  # remove "City" from vector fields
     vector_values = list(row_dict.values())  # remaining numeric values
