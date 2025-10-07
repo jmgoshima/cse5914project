@@ -11,19 +11,19 @@ load_dotenv(dotenv_path=env_path_relative)
 es = Elasticsearch('http://localhost:9200', basic_auth=('elastic', os.getenv("ES_LOCAL_PASSWORD")), verify_certs=False)
 index_name = "us_cities"
 
-city_to_search = "Columbus,OH"
+city_to_search = "Random City"
 
-# Fetch the city’s vector from ES
-city_doc = es.search(
-    index=index_name,
-    query={"term": {"city": city_to_search}},
-    size=1
-)
+# # Fetch the city’s vector from ES
+# city_doc = es.search(
+#     index=index_name,
+#     query={"term": {"city": city_to_search}},
+#     size=1
+# )
 
-if not city_doc["hits"]["hits"]:
-    raise ValueError(f"City '{city_to_search}' not found in index '{index_name}'.")
+# if not city_doc["hits"]["hits"]:
+#     raise ValueError(f"City '{city_to_search}' not found in index '{index_name}'.")
 
-query_vector = city_doc["hits"]["hits"][0]["_source"]["review_vector"]
+# query_vector = city_doc["hits"]["hits"][0]["_source"]["review_vector"]
 
 def get_query_vector(json_path):
     with open(json_path, "r") as f:
