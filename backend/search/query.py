@@ -25,6 +25,22 @@ if not city_doc["hits"]["hits"]:
 
 query_vector = city_doc["hits"]["hits"][0]["_source"]["review_vector"]
 
+def get_query_vector(json_path):
+    with open(json_path, "r") as f:
+        data = json.load(f)
+    
+    # Convert to dict if it's a list of objects
+    if isinstance(data, list):
+        if len(data) != 1:
+            raise ValueError("JSON file must contain exactly one record when used as a query vector.")
+        data = data[0]
+    
+    vector = [float(v) for v in data.values()]
+    return vector
+
+query_vector = get_query_vector("data/test_city.json")
+
+
 # Run kNN to find similar cities
 response = es.search(
     index=index_name,
