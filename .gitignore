@@ -1,0 +1,8 @@
+# ignore virtual environments
+.venv
+
+# ignore elastic search local instance
+elastic-start-local
+
+# ignore LLM .env
+.env

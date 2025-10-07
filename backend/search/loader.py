@@ -1,111 +1,106 @@
 from elasticsearch import Elasticsearch, helpers
 from pathlib import Path
 import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from dotenv import load_dotenv
 import os
 
+# 0. load .env variables from elastic-start-local
 
-# Path to CSV relative to this file (robust across CWDs)
-DATA_PATH = Path(__file__).parent / "data" / "places.csv"
+env_path_relative = Path(__file__).parent.parent.parent / "elastic-start-local" / ".env"
+load_dotenv(dotenv_path=env_path_relative)
 
-# Canonical index name
-INDEX_NAME = os.getenv("ES_INDEX", "us_cities")
+# 1. Clean and Normalize Data
+
+# Load data as a dataframe
+df = pd.read_csv(Path(__file__).parent / "data" / "places.csv")
+
+# Remove CaseNum, Long, Lat, StNum
+df = df.drop(['CaseNum', 
+              'Long',
+              'Lat',
+              'StNum'],
+              axis = 1)
+
+df.hist()
+
+# Rescale values to a range from low_num to high_num
+low_num = 0
+high_num = 10
+
+# Select only numerical columns for scaling
+numerical_cols = df.select_dtypes(include=['number']).columns
+
+# Initialize Scalers
+min_max_scaler = MinMaxScaler((low_num, high_num))
+z_score_scaler = StandardScaler()
+
+# Apply Min-Max Scaling to numerical columns
+min_max_df = df.copy()
+min_max_df[numerical_cols] = min_max_scaler.fit_transform(df[numerical_cols])
+
+# Apply z-score normalization to numerical columns
+z_score_df = df.copy()
+z_score_df[numerical_cols] = z_score_scaler.fit_transform(df[numerical_cols])
 
 
-def _normalize_row(row):
-    # Map CSV columns to canonical field names expected by the backend
-    def _safe_float(x):
-        try:
-            return float(x)
-        except Exception:
-            return None
+print(min_max_df.head(10))
+print(z_score_df.head(10))
 
-    def _safe_int(x):
-        try:
-            return int(x)
-        except Exception:
-            return None
+min_max_df.to_csv(Path(__file__).parent / "data" / "places_min_max.csv", index=False)
+z_score_df.to_csv(Path(__file__).parent / "data" / "places_z_score.csv", index=False)
 
-    name = row.get("City")
-    # try split state if present
-    state = None
-    if isinstance(name, str) and "," in name:
-        parts = [p.strip() for p in name.split(",")]
-        if len(parts) >= 2:
-            state = parts[-1]
+
+# 2. Loading data into elastic search
+#df = pd.read_csv("data/places.csv")
+index_name = "us_cities"
+es = Elasticsearch('http://localhost:9200', basic_auth=('elastic', os.getenv("ES_LOCAL_PASSWORD")), verify_certs=False)
+
+# # prepare bulk actions
+# actions = [
+#     {
+#         "_index": index_name,
+#         "_source": row.to_dict()
+#     }
+#     for _, row in z_score_df.iterrows()
+# ]
+
+# Define mapping for the index
+dims = len(z_score_df.columns) - 1  # exclude "City" column
+mapping = {
+    "mappings": {
+        "properties": {
+            "city": {"type": "keyword"},
+            "review_vector": {"type": "dense_vector", "dims": dims}
+        }
+    }
+}
+
+# delete existing index if it exists
+if es.indices.exists(index=index_name):
+    es.indices.delete(index=index_name)
+
+es.indices.create(index=index_name, body=mapping)
+
+# Prepare bulk actions
+actions = []
+for _, row in z_score_df.iterrows():
+    row_dict = row.to_dict()
+    city_name = row_dict.pop("City")  # remove "City" from vector fields
+    vector_values = list(row_dict.values())  # remaining numeric values
 
     doc = {
-        "name": name,
-        "case_num": _safe_int(row.get("CaseNum")),
-        "housing_cost": _safe_float(row.get("HousingCost")),
-        "climate_score": _safe_int(row.get("Climate")),
-        "healthcare_score": _safe_float(row.get("HlthCare")),
-        "crime_score": _safe_float(row.get("Crime")),
-        "transit_score": _safe_float(row.get("Transp")),
-        "education_score": _safe_float(row.get("Educ")),
-        "arts_score": _safe_float(row.get("Arts")),
-        "recreation_score": _safe_float(row.get("Recreat")),
-        "economy_score": _safe_float(row.get("Econ")),
-        "population": _safe_int(row.get("Pop")),
-        "state": state,
-    }
-
-    # Geo point
-    lon = row.get("Long")
-    lat = row.get("Lat")
-    try:
-        lonf = float(lon)
-        latf = float(lat)
-        doc["location"] = {"lon": lonf, "lat": latf}
-    except Exception:
-        # skip geo if invalid
-        pass
-
-    # Clean None values (Elasticsearch can accept nulls but we'll drop them for cleanliness)
-    doc = {k: v for k, v in doc.items() if v is not None}
-    return doc
-
-
-def load_into_es(csv_path: Path = DATA_PATH, index_name: str = INDEX_NAME, es_url: str = None):
-    """Load the CSV into Elasticsearch using canonical field names.
-
-    This function is idempotent for the same index (it will index documents
-    and overwrite by `_id` if CaseNum is present and used). It does not create
-    index mappings automatically.
-    """
-    if not csv_path.exists():
-        raise FileNotFoundError(f"CSV not found at {csv_path}")
-
-    df = pd.read_csv(csv_path)
-
-    es_url = es_url or os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
-    es = Elasticsearch(es_url)
-
-    actions = []
-    for _, row in df.iterrows():
-        doc = _normalize_row(row)
-        if not doc:
-            continue
-        op = {
-            "_op_type": "index",
-            "_index": index_name,
-            "_source": doc,
+        "_index": index_name,
+        "_source": {
+            "city": city_name,
+            "review_vector": vector_values
         }
-        # Use case_num as _id if present
-        if doc.get("case_num"):
-            op["_id"] = str(doc["case_num"])
-        actions.append(op)
+    }
+    actions.append(doc)
 
-    if not actions:
-        print("No documents to index.")
-        return
+# bulk insert
+helpers.bulk(es, actions)
 
-    helpers.bulk(es, actions)
-    print(f"Indexed {len(actions)} documents into index '{index_name}'")
+print(f"Inserted {len(actions)} records into index '{index_name}'.")
 
-
-if __name__ == "__main__":
-    # Simple CLI to load the CSV
-    try:
-        load_into_es()
-    except Exception as e:
-        print("Failed to load CSV:", e)

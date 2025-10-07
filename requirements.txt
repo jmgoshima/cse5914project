@@ -4,15 +4,18 @@ pydantic>=2.0,<3
 
 # Data
 pandas>=1.5,<2
+matplotlib
+scikit-learn
 
 # Elasticsearch client (8.x compatible)
 elasticsearch>=8.0.0,<9
 
-# LLM / OpenAI
-openai>=0.27.0
-
 # Optional: langchain if you plan to run end-to-end chains
 langchain>=0.0.300
+
+# LLM / Gemini (LangChain + native client)
+langchain-google-genai>=0.0.10
+google-generativeai>=0.6.0
 
 # Utilities / dev
 python-dotenv>=1.0.0
