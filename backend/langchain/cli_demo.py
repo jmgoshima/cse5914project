@@ -26,7 +26,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from backend.langchain.schemas import Profile
-from backend.langchain.conversation import stepAgent_with_callback
+from backend.langchain.conversation import stepAgent_with_callback, enrich_search_results
 from backend.search.query import search_for_profile, PROFILE_METRICS
 
 # Best-effort check to report whether LLM is wired up (optional)
@@ -43,6 +43,37 @@ def _pretty(obj: Any) -> str:
         return json.dumps(obj, indent=2)
     except Exception:
         return str(obj)
+
+
+def _display_search_results(payload: Dict[str, Any]) -> None:
+    results = payload.get("results")
+    if isinstance(results, list) and results:
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        took = meta.get("took_ms") if isinstance(meta, dict) else None
+        total_hits = meta.get("total_hits") if isinstance(meta, dict) else None
+
+        header_parts = []
+        if isinstance(total_hits, int):
+            header_parts.append(f"{total_hits} total hits")
+        if isinstance(took, (int, float)):
+            header_parts.append(f"{took} ms")
+
+        if header_parts:
+            print(f"Top matches ({', '.join(header_parts)}):")
+        else:
+            print("Top matches:")
+
+        for entry in results:
+            city = entry.get("city", "Unknown city")
+            score = entry.get("score")
+            score_text = f"{score:.3f}" if isinstance(score, (int, float)) else score
+            print(f"- {city} (score {score_text})")
+            reason = entry.get("reasoning")
+            if isinstance(reason, str) and reason.strip():
+                print(f"  {reason.strip()}")
+        return
+
+    print(_pretty(payload))
 
 
 SEARCH_TOP_K: int = 5
@@ -66,13 +97,21 @@ def _search_on_ready(profile: Profile) -> Dict[str, Any]:
         return {"error": str(exc)}
 
     try:
-        return search_for_profile(
+        raw_response = search_for_profile(
             vector,
             k=SEARCH_TOP_K,
             num_candidates=SEARCH_NUM_CANDIDATES,
         )
     except Exception as exc:
         return {"error": f"Search failed: {exc}"}
+
+    try:
+        return enrich_search_results(profile, raw_response)
+    except Exception as exc:  # pragma: no cover - defensive
+        return {
+            "error": f"Failed to format search results: {exc}",
+            "raw_response": raw_response,
+        }
 
 
 def _require_llm() -> bool:
@@ -129,7 +168,7 @@ def run_messages(messages: List[str], start_profile_path: str | None, keep_going
                 print(result["error"])
             else:
                 print("\nProfile ready. Search results:")
-                print(_pretty(result))
+                _display_search_results(result)
             if not keep_going:
                 return 0
 
@@ -194,7 +233,7 @@ def run_interactive(start_profile_path: str | None) -> int:
                 print(result["error"])
             else:
                 print("\nProfile ready. Search results:")
-                print(_pretty(result))
+                _display_search_results(result)
             print("\nType more to refine further, or 'exit' to quit.")
         print("---")
 

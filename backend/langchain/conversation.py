@@ -14,6 +14,7 @@ Design goals
 """
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Dict, Optional, Callable, List
 
@@ -68,7 +69,7 @@ _LC_AVAILABLE = True
 try:
     from langchain_google_genai import ChatGoogleGenerativeAI
     from langchain_core.prompts import ChatPromptTemplate
-    from langchain_core.output_parsers import PydanticOutputParser
+    from langchain_core.output_parsers import PydanticOutputParser, StrOutputParser
 except Exception:  # pragma: no cover
     _LC_AVAILABLE = False
 
@@ -97,6 +98,8 @@ _LLM = None
 _BASE_PARSER = None
 _PARSER = None
 _PROMPT = None
+_EXPLAIN_PROMPT = None
+_EXPLAIN_CHAIN = None
 
 if _LC_AVAILABLE:
     try:  # lazy, tolerate missing keys
@@ -133,11 +136,38 @@ Be precise and deterministic.
             ),
             ("human", "CURRENT_PROFILE:\n{current_profile}\n\nUSER_MESSAGE:\n{user_message}"),
         ])
+        _EXPLAIN_PROMPT = ChatPromptTemplate.from_messages([
+            (
+                "system",
+                """
+You are a relocation analyst. Using the user's 0-10 relocation preference scores and conversation notes,
+explain why each candidate city returned from search is a good match. Each explanation must be 1-2 sentences,
+connect specific preferences to the city, and avoid generic filler phrases. Produce JSON with entries containing
+`city` (string), `score` (float), and `reasoning` (string). Preserve the order of the candidates provided.
+                """.strip(),
+            ),
+            (
+                "human",
+                """
+PROFILE METRICS:
+{metrics_json}
+
+CONVERSATION TURNS:
+{turns_json}
+
+CANDIDATE CITIES:
+{cities_json}
+                """.strip(),
+            ),
+        ])
+        _EXPLAIN_CHAIN = _EXPLAIN_PROMPT | _LLM | StrOutputParser()
     except Exception:
         _LLM = None
         _BASE_PARSER = None
         _PARSER = None
         _PROMPT = None
+        _EXPLAIN_PROMPT = None
+        _EXPLAIN_CHAIN = None
 
 
 def stepAgent(profile: Profile, message: str) -> Profile:
@@ -187,6 +217,116 @@ def stepAgent(profile: Profile, message: str) -> Profile:
             if nq:
                 merged.notes["next_question"] = nq
     return merged
+
+
+def _profile_metric_map(profile: Profile) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    for metric in METRIC_ORDER:
+        value = getattr(profile, metric, None)
+        if value is not None:
+            metrics[metric] = float(value)
+    return metrics
+
+
+def _profile_turns(profile: Profile) -> List[str]:
+    if isinstance(profile.notes, dict):
+        turns = profile.notes.get("turns")
+        if isinstance(turns, list):
+            return [str(turn) for turn in turns]
+    return []
+
+
+def _fallback_reason(candidate: Dict[str, Any]) -> str:
+    city = candidate.get("city", "Unknown city")
+    score = candidate.get("score")
+    score_text = f"{float(score):.3f}" if isinstance(score, (int, float)) else "n/a"
+    return f"{city} was returned by similarity search (score {score_text})."
+
+
+def _generate_city_reasons(profile: Profile, candidates: List[Dict[str, Any]]) -> List[str]:
+    if not candidates:
+        return []
+
+    fallback = [_fallback_reason(candidate) for candidate in candidates]
+    if not _EXPLAIN_CHAIN:
+        return fallback
+
+    payload = {
+        "metrics_json": json.dumps(_profile_metric_map(profile), indent=2, sort_keys=True),
+        "turns_json": json.dumps(_profile_turns(profile), indent=2),
+        "cities_json": json.dumps(candidates, indent=2),
+    }
+
+    try:
+        raw = _EXPLAIN_CHAIN.invoke(payload)
+    except Exception:
+        return fallback
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return fallback
+
+    reasons: List[str] = []
+    for idx, candidate in enumerate(candidates):
+        entry: Any = parsed[idx] if isinstance(parsed, list) and idx < len(parsed) else None
+        text: Optional[str] = None
+        if isinstance(entry, dict):
+            text = entry.get("reasoning") or entry.get("explanation") or entry.get("summary")
+        elif isinstance(entry, str):
+            text = entry
+
+        if isinstance(text, str) and text.strip():
+            reasons.append(text.strip())
+        else:
+            reasons.append(fallback[idx])
+    return reasons
+
+
+def enrich_search_results(profile: Profile, search_response: Dict[str, Any]) -> Dict[str, Any]:
+    """Return kNN hits augmented with short LLM rationales."""
+    if not isinstance(search_response, dict):
+        return {"meta": {}, "results": []}
+
+    raw_hits = []
+    try:
+        raw_hits = search_response.get("hits", {}).get("hits", [])
+    except Exception:
+        raw_hits = []
+
+    candidates: List[Dict[str, Any]] = []
+    for idx, hit in enumerate(raw_hits):
+        source = hit.get("_source") if isinstance(hit, dict) else {}
+        if not isinstance(source, dict):
+            source = {}
+        city = source.get("city") or hit.get("_id") or f"Result {idx + 1}"
+        score = hit.get("_score")
+        candidates.append({
+            "rank": idx + 1,
+            "city": city,
+            "score": float(score) if isinstance(score, (int, float)) else score,
+            "review_vector": source.get("review_vector"),
+        })
+
+    reasons = _generate_city_reasons(profile, candidates)
+    for idx, candidate in enumerate(candidates):
+        candidate["reasoning"] = reasons[idx] if idx < len(reasons) else _fallback_reason(candidate)
+
+    summary: Dict[str, Any] = {
+        "took_ms": search_response.get("took"),
+        "total_hits": None,
+    }
+    try:
+        total = search_response.get("hits", {}).get("total", {})
+        if isinstance(total, dict):
+            summary["total_hits"] = total.get("value")
+    except Exception:
+        pass
+
+    return {
+        "meta": summary,
+        "results": candidates,
+    }
 
 
 def _default_next_question(profile: Profile) -> Optional[str]:
