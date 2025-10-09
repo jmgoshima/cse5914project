@@ -1,14 +1,25 @@
-from elasticsearch import Elasticsearch, helpers
+from elasticsearch import Elasticsearch
 import os
 import json
-import re
+import sys
 from pathlib import Path
+from typing import List, Sequence, Union
 from dotenv import load_dotenv
 
 env_path_relative = Path(__file__).parent.parent.parent / "elastic-start-local" / ".env"
 load_dotenv(dotenv_path=env_path_relative)
 
-es = Elasticsearch('http://localhost:9200', basic_auth=('elastic', os.getenv("ES_LOCAL_PASSWORD")), verify_certs=False)
+# Build Elasticsearch client without auth if no local password is provided.
+es_password = os.getenv("ES_LOCAL_PASSWORD")
+es_client_kwargs = {"verify_certs": False}
+if es_password:
+    es_client_kwargs["basic_auth"] = ("elastic", es_password)
+else:
+    print(
+        "Warning: ES_LOCAL_PASSWORD not set; attempting unauthenticated connection to Elasticsearch."
+    )
+
+es = Elasticsearch("http://localhost:9200", **es_client_kwargs)
 index_name = "us_cities"
 
 city_to_search = "Random City"
@@ -25,40 +36,106 @@ city_to_search = "Random City"
 
 # query_vector = city_doc["hits"]["hits"][0]["_source"]["review_vector"]
 
-def get_query_vector(json_path):
-    with open(json_path, "r") as f:
-        data = json.load(f)
-    
-    # Convert to dict if it's a list of objects
-    if isinstance(data, list):
-        if len(data) != 1:
-            raise ValueError("JSON file must contain exactly one record when used as a query vector.")
-        data = data[0]
-    
-    vector = [float(v) for v in data.values()]
-    return vector
-
-query_vector = get_query_vector("data/test_city.json")
-
-
-# Run kNN to find similar cities
-response = es.search(
-    index=index_name,
-    knn={
-        "field": "review_vector",
-        "query_vector": query_vector,
-        "k": 5,               # how many nearest neighbors
-        "num_candidates": 50  # search depth
-    }
+EXPECTED_VECTOR_KEYS: Sequence[str] = (
+    "Climate",
+    "HousingCost",
+    "HlthCare",
+    "Crime",
+    "Transp",
+    "Educ",
+    "Arts",
+    "Recreat",
+    "Econ",
+    "Pop",
 )
 
-# Print results (excluding the city itself)
-print(f"Nearest neighbors to {city_to_search}:")
-for hit in response["hits"]["hits"]:
-    city = hit["_source"]["city"]
-    score = hit["_score"]
-    if city != city_to_search:   # skip the same city
-        print(f"  {city:20}  (score={score:.4f})")
+
+def _normalize_query_values(values: Sequence[Union[int, float]]) -> List[float]:
+    return [float(v) for v in values]
+
+
+def _dict_to_vector(data: dict) -> List[float]:
+    vector: List[float] = []
+    for key in EXPECTED_VECTOR_KEYS:
+        value = data.get(key)
+        if value is None:
+            vector.append(0.0)
+            continue
+        try:
+            vector.append(float(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Value for '{key}' must be numeric or null, got {value!r}."
+            ) from exc
+    return vector
+
+
+def get_query_vector_from_payload(payload: str) -> List[float]:
+    data = json.loads(payload)
+
+    if isinstance(data, list):
+        if len(data) != 1:
+            raise ValueError(
+                "JSON payload must contain exactly one record when provided as a list."
+            )
+        data = data[0]
+
+    if isinstance(data, dict):
+        return _dict_to_vector(data)
+
+    if isinstance(data, (list, tuple)):
+        return _normalize_query_values(data)
+
+    raise TypeError(
+        "Query payload must be a JSON object, single-element list, or list of numbers."
+    )
+
+
+def get_query_vector_from_file(json_path: Path) -> List[float]:
+    with open(json_path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    return get_query_vector_from_payload(raw)
+
+
+def resolve_query_vector(argv: Sequence[str]) -> List[float]:
+    if len(argv) >= 2:
+        payload = argv[1]
+        return get_query_vector_from_payload(payload)
+
+    default_path = Path(__file__).parent / "data" / "test_city.json"
+    if not default_path.exists():
+        raise FileNotFoundError(
+            "No query payload provided and default vector file is missing."
+        )
+    print(f"No query payload supplied; falling back to {default_path}.")
+    return get_query_vector_from_file(default_path)
+
+
+def main(argv: Sequence[str]) -> None:
+    query_vector = resolve_query_vector(argv)
+
+    # Run kNN to find similar cities
+    response = es.search(
+        index=index_name,
+        knn={
+            "field": "review_vector",
+            "query_vector": query_vector,
+            "k": 5,  # how many nearest neighbors
+            "num_candidates": 50,  # search depth
+        },
+    )
+
+    # Print results (excluding the city itself)
+    print(f"Nearest neighbors to {city_to_search}:")
+    for hit in response["hits"]["hits"]:
+        city = hit["_source"]["city"]
+        score = hit["_score"]
+        if city != city_to_search:  # skip the same city
+            print(f"  {city:20}  (score={score:.4f})")
+
+
+if __name__ == "__main__":
+    main(sys.argv)
 
 # # Example 1: Cities with HousingCost <= 6000, sorted by HlthCare descending
 # query = {

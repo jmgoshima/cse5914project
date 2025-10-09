@@ -22,7 +22,10 @@ Environment:
 
 import argparse
 import json
+import re
+import subprocess
 import sys
+from pathlib import Path
 from typing import Any, Dict, List
 
 from backend.langchain.schemas import Profile
@@ -52,64 +55,104 @@ def _pretty(obj: Any) -> str:
 USE_LLM_REASONS: bool = False
 
 
-def mock_on_ready(profile: Profile) -> Dict[str, Any]:
-    """Return a fake search result; avoids any ES dependency."""
-    # You can tailor the mock using simple heuristics from the profile
-    warm = "warm" in (profile.preferred_climates or [])
-    remote = bool(profile.wants_remote_friendly)
-    budget = profile.budget_monthly_usd or 0
+QUERY_SCRIPT_PATH = Path(__file__).resolve().parent.parent / "search" / "query.py"
 
+def _profile_to_query_payload(profile: Profile) -> Dict[str, Any]:
+    notes = profile.notes if isinstance(profile.notes, dict) else {}
+    payload: Dict[str, Any] = {
+        "Climate": ", ".join(profile.preferred_climates) if profile.preferred_climates else None,
+        "HousingCost": profile.housing_cost_target_max or profile.budget_monthly_usd,
+        "HlthCare": profile.healthcare_min_score,
+        "Crime": profile.safety_min_score,
+        "Transp": profile.transit_min_score,
+        "Educ": profile.education_min_score,
+        "Arts": notes.get("arts"),
+        "Recreat": notes.get("recreation"),
+        "Econ": profile.economy_score_min,
+        "Pop": profile.population_min,
+    }
+    return payload
+
+def _parse_query_output(raw_output: str) -> Dict[str, Any]:
+    lines = [line.strip() for line in raw_output.splitlines() if line.strip()]
+    header = None
     cities: List[Dict[str, Any]] = []
-    if warm:
-        cities.append({
-            "id": "1",
-            "name": "Austin, TX",
-            "score": 1.0,
-            "reason": None,
-        })
-        cities.append({
-            "id": "2",
-            "name": "San Diego, CA",
-            "score": 0.9,
-            "reason": None,
-        })
-    else:
-        cities.append({
-            "id": "3",
-            "name": "Seattle, WA",
-            "score": 0.85,
-            "reason": None,
-        })
-
-    # Filter mock by budget very loosely (purely illustrative)
-    if budget and budget < 2000:
-        cities = [c for c in cities if "Austin" in c["name"]]
-
-    # Optionally generate LLM reasons
-    if USE_LLM_REASONS:
-        for c in cities:
+    for line in lines:
+        if header is None and line.lower().startswith("nearest neighbors"):
+            header = line
+            continue
+        match = re.match(r"(.+?)\s+\(score=([0-9.]+)\)", line)
+        if match:
+            name = match.group(1).strip()
+            score_str = match.group(2)
             try:
-                prompt = (
-                    "You are a relocation advisor. In 2–4 sentences, explain why this city fits the user's preferences. "
-                    "Reference cost of living, climate, safety, job market, and lifestyle if available. "
-                    "No markdown, no lists.\n\n"
-                    f"USER_PROFILE_JSON:\n{profile.model_dump_json()}\n\nCITY_NAME:\n{c['name']}\n\nREASON:"
-                )
-                c["reason"] = explain(prompt).strip()
-            except Exception:
-                c["reason"] = c.get("reason") or "(reason unavailable)"
-
-    return {
+                score = float(score_str)
+            except ValueError:
+                score = score_str
+            cities.append({
+                "id": None,
+                "name": name,
+                "score": score,
+                "reason": None,
+            })
+    result: Dict[str, Any] = {
         "count": len(cities),
         "cities": cities,
-        "raw_query": {"mock": True},
-        "notes": {
-            "llm_mode": bool(_AGENT_LLM),
-            "remote": remote,
-            "budget": budget,
-        }
+        "raw_output": raw_output.strip(),
     }
+    if header:
+        result["header"] = header
+    return result
 
+def query_on_ready(profile: Profile) -> Dict[str, Any]:
+    payload = _profile_to_query_payload(profile)
+    profile_json = json.dumps(payload)
+    script_path = QUERY_SCRIPT_PATH
+
+    if not script_path.exists():
+        return {
+            "count": 0,
+            "cities": [],
+            "error": f"Query script not found at {script_path}",
+            "profile_payload": payload,
+        }
+
+    cmd = [sys.executable, str(script_path), profile_json]
+    try:
+        completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        return {
+            "count": 0,
+            "cities": [],
+            "error": f"Query script failed with exit code {exc.returncode}",
+            "stderr": (exc.stderr or "").strip(),
+            "stdout": (exc.stdout or "").strip(),
+            "profile_payload": payload,
+            "command": cmd,
+        }
+
+    result = _parse_query_output(completed.stdout)
+    if completed.stderr and completed.stderr.strip():
+        result["stderr"] = completed.stderr.strip()
+    result["profile_payload"] = payload
+    result["command"] = cmd
+
+    if USE_LLM_REASONS and result.get("cities"):
+        for city in result["cities"]:
+            if not city.get("name"):
+                continue
+            try:
+                prompt = (
+                    "You are a relocation advisor. In 2-4 sentences, explain why this city fits the user's preferences. "
+                    "Reference cost of living, climate, safety, job market, and lifestyle if available. "
+                    "No markdown, no lists.\n\n"
+                    f"USER_PROFILE_JSON:\n{profile.model_dump_json()}\n\nCITY_NAME:\n{city['name']}\n\nREASON:"
+                )
+                city["reason"] = explain(prompt).strip()
+            except Exception:
+                city["reason"] = city.get("reason") or "(reason unavailable)"
+
+    return result
 
 def run_messages(messages: List[str], start_profile_path: str | None, keep_going: bool) -> int:
     profile = Profile()
@@ -125,7 +168,7 @@ def run_messages(messages: List[str], start_profile_path: str | None, keep_going
     print(f"Agent mode: {'LLM' if _AGENT_LLM else 'Heuristic'}\n")
 
     for i, msg in enumerate(messages, 1):
-        out = stepAgent_with_callback(profile, msg, on_ready=mock_on_ready)
+        out = stepAgent_with_callback(profile, msg, on_ready=query_on_ready)
         profile = out["profile"]
 
         print(f"Turn {i} - User: {msg}")
@@ -143,7 +186,7 @@ def run_messages(messages: List[str], start_profile_path: str | None, keep_going
             pass
 
         if profile.notes.get("ready"):
-            print("\nProfile ready. Mock recommendations:")
+            print("\nProfile ready. Query results:")
             print(_pretty(out.get("on_ready_result", {})))
             if not keep_going:
                 return 0
@@ -179,7 +222,7 @@ def run_interactive(start_profile_path: str | None) -> int:
             return 0
 
         turn += 1
-        out = stepAgent_with_callback(profile, msg, on_ready=mock_on_ready)
+        out = stepAgent_with_callback(profile, msg, on_ready=query_on_ready)
         profile = out["profile"]
 
         print("Updated Profile:")
@@ -196,14 +239,14 @@ def run_interactive(start_profile_path: str | None) -> int:
             pass
 
         if profile.notes.get("ready"):
-            print("\nProfile ready. Mock recommendations:")
+            print("\nProfile ready. Query results:")
             print(_pretty(out.get("on_ready_result", {})))
             print("\nType more to refine further, or 'exit' to quit.")
         print("---")
 
 
 def main(argv: List[str]) -> int:
-    parser = argparse.ArgumentParser(description="Run the conversation agent locally (no ES), with mock recommendations.")
+    parser = argparse.ArgumentParser(description="Run the conversation agent locally (no ES), using the search query integration.")
     parser.add_argument(
         "-m", "--message", dest="messages", action="append", default=[],
         help="Provide a user message (repeatable for multi-turn). If omitted, runs interactive mode.",
@@ -218,7 +261,7 @@ def main(argv: List[str]) -> int:
     )
     parser.add_argument(
         "--llm-reasons", action="store_true",
-        help="Use the LLM to generate reasons for mock results (requires API key).",
+        help="Use the LLM to generate reasons for query results (requires API key).",
     )
 
     args = parser.parse_args(argv)
