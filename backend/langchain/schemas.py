@@ -20,44 +20,18 @@ class HardFilters(BaseModel):
 
 
 class Profile(BaseModel):
-    # Canonical search fields aligned to loader
-    case_num: Optional[int] = None
-    name: Optional[str] = None
+    Climate: Optional[float] = Field(default=None, ge=0, le=10)
+    HousingCost: Optional[float] = Field(default=None, ge=0, le=10)
+    HlthCare: Optional[float] = Field(default=None, ge=0, le=10)
+    Crime: Optional[float] = Field(default=None, ge=0, le=10)
+    Transp: Optional[float] = Field(default=None, ge=0, le=10)
+    Educ: Optional[float] = Field(default=None, ge=0, le=10)
+    Arts: Optional[float] = Field(default=None, ge=0, le=10)
+    Recreat: Optional[float] = Field(default=None, ge=0, le=10)
+    Econ: Optional[float] = Field(default=None, ge=0, le=10)
+    Pop: Optional[float] = Field(default=None, ge=0, le=10)
 
-    # Cost preferences (either absolute or target max)
-    housing_cost_target_max: Optional[float] = None
-    housing_cost_target_min: Optional[float] = None
-
-    # Preferred climates as categories (warm/temperate/cold) OR numeric scores
-    preferred_climates: List[str] = Field(default_factory=list)
-    climate_score_min: Optional[int] = None
-
-    # Economy / job market
-    economy_score_min: Optional[float] = None
-
-    # Safety: we treat lower crime as better; callers can set a minimum safety metric
-    safety_min_score: Optional[float] = None
-
-    # Other dataset-aligned signals
-    healthcare_min_score: Optional[float] = None
-    transit_min_score: Optional[float] = None
-    education_min_score: Optional[float] = None
-
-    # Location and population
-    location: Optional[Dict[str, float]] = None  # {'lat': float, 'lon': float}
-    population_min: Optional[int] = None
-
-    # Legacy / conversational fields (kept for backward compatibility)
-    budget_monthly_usd: Optional[int] = None
-    industry: Optional[str] = None
-    wants_remote_friendly: Optional[bool] = None
-    commute_preference: Optional[str] = None
-
-    # Optional weighting and hard filters
-    weights: Optional[Weights] = None
-    hard_filters: Optional[HardFilters] = None
-
-    # Free-form notes & metadata
+    # Metadata the agent uses for clarifying questions, readiness, etc.
     notes: Dict[str, Any] = Field(default_factory=dict)
 
     class Config:

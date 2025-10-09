@@ -57,15 +57,6 @@ min_max_df.to_csv(Path(__file__).parent / "data" / "places_min_max.csv", index=F
 index_name = "us_cities"
 es = Elasticsearch('http://localhost:9200', basic_auth=('elastic', os.getenv("ES_LOCAL_PASSWORD")), verify_certs=False)
 
-# # prepare bulk actions
-# actions = [
-#     {
-#         "_index": index_name,
-#         "_source": row.to_dict()
-#     }
-#     for _, row in z_score_df.iterrows()
-# ]
-
 # Define mapping for the index
 dims = len(min_max_df.columns) - 1  # exclude "City" column
 mapping = {
