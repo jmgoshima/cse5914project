@@ -1,6 +1,6 @@
 from __future__ import annotations
-import os, json, uuid
-from datetime import datetime
+import os, json, uuid, threading
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 from flask import Flask, jsonify, request, g
 from flask_cors import CORS
@@ -23,11 +23,14 @@ def create_app() -> Flask:
         TAKE_DEFAULT=int(os.getenv("TAKE_DEFAULT", "5")),
         CORS_ORIGINS=os.getenv("CORS_ORIGINS", "*"),
         CACHE_TTL_SECONDS=int(os.getenv("CACHE_TTL_SECONDS", "3600")),
+        CONVERSATION_TTL_SECONDS=int(os.getenv("CONVERSATION_TTL_SECONDS", "900")),
     )
 
     CORS(app, resources={r"/*": {"origins": app.config["CORS_ORIGINS"]}})
 
     _es, _cache = None, None
+    _conversation_state: Dict[str, Dict[str, Any]] = {}
+    _conversation_lock = threading.Lock()
     def es():
         nonlocal _es
         if _es is None:
@@ -38,6 +41,64 @@ def create_app() -> Flask:
         if _cache is None:
             _cache = get_cache()
         return _cache
+
+    def _load_conversation_state(conversation_id: str) -> Optional[Tuple[Profile, Optional[Weights], Optional[HardFilters]]]:
+        if not conversation_id:
+            return None
+        with _conversation_lock:
+            state = _conversation_state.get(conversation_id)
+            if not state:
+                return None
+            expires_at = state.get("expires_at")
+            if isinstance(expires_at, datetime) and expires_at <= datetime.utcnow():
+                _conversation_state.pop(conversation_id, None)
+                return None
+            state = dict(state)
+        try:
+            profile_json = state.get("profile")
+            weights_json = state.get("weights")
+            hard_filters_json = state.get("hard_filters")
+            if isinstance(profile_json, str):
+                profile = Profile.model_validate_json(profile_json)
+            elif isinstance(profile_json, dict):
+                profile = Profile(**profile_json)
+            else:
+                profile = Profile()
+            if isinstance(weights_json, str):
+                weights = Weights.model_validate_json(weights_json)
+            elif isinstance(weights_json, dict):
+                weights = Weights(**weights_json)
+            else:
+                weights = None
+            if isinstance(hard_filters_json, str):
+                hard_filters = HardFilters.model_validate_json(hard_filters_json)
+            elif isinstance(hard_filters_json, dict):
+                hard_filters = HardFilters(**hard_filters_json)
+            else:
+                hard_filters = None
+        except Exception:
+            return None
+        return profile, weights, hard_filters
+
+    def _store_conversation_state(conversation_id: str, profile: Profile, weights: Optional[Weights], hard_filters: Optional[HardFilters]) -> None:
+        ttl_seconds = int(app.config.get("CONVERSATION_TTL_SECONDS", 900))
+        expires_at = datetime.utcnow() + timedelta(seconds=ttl_seconds)
+        state = {
+            "profile": profile.model_dump_json(),
+            "weights": weights.model_dump_json() if weights else None,
+            "hard_filters": hard_filters.model_dump_json() if hard_filters else None,
+            "expires_at": expires_at,
+        }
+        with _conversation_lock:
+            _conversation_state[conversation_id] = state
+
+    def _touch_conversation_state(conversation_id: str) -> None:
+        ttl_seconds = int(app.config.get("CONVERSATION_TTL_SECONDS", 900))
+        with _conversation_lock:
+            state = _conversation_state.get(conversation_id)
+            if state:
+                state["expires_at"] = datetime.utcnow() + timedelta(seconds=ttl_seconds)
+
 
     # ---------- small helpers ----------
     def ok(data: Any, status: int = 200):
@@ -115,11 +176,47 @@ def create_app() -> Flask:
         msg = body.get("message")
         if not msg:
             return err("Missing 'message'.", 422)
-        profile, weights, hard_filters = parse_envelope(body)
+        conversation_id = body.get("conversationId") or body.get("conversation_id")
+        conversation_id = str(conversation_id) if conversation_id else None
+
+        profile: Profile
+        weights: Optional[Weights]
+        hard_filters: Optional[HardFilters]
+
+        if "profile" in body and isinstance(body["profile"], dict):
+            profile, weights, hard_filters = parse_envelope(body)
+        elif conversation_id:
+            loaded = _load_conversation_state(conversation_id)
+            if not loaded:
+                return err("Conversation expired or unknown. Send a full profile to start a new conversation.", 404)
+            profile, weights, hard_filters = loaded
+            _touch_conversation_state(conversation_id)
+        else:
+            profile, weights, hard_filters = Profile(), None, None
+            conversation_id = str(uuid.uuid4())
+
+        if isinstance(body.get("weights"), dict):
+            try:
+                weights = Weights(**body["weights"])
+            except Exception as exc:
+                return err("Invalid 'weights' payload.", 422, {"reason": str(exc)})
+
+        if isinstance(body.get("hard_filters"), dict):
+            try:
+                hard_filters = HardFilters(**body["hard_filters"])
+            except Exception as exc:
+                return err("Invalid 'hard_filters' payload.", 422, {"reason": str(exc)})
+
         updated = stepAgent(profile=profile, message=msg)
-        return ok({"profile": json.loads(updated.model_dump_json()),
-                   "weights": json.loads(weights.model_dump_json()) if weights else None,
-                   "hard_filters": json.loads(hard_filters.model_dump_json()) if hard_filters else None})
+        if conversation_id is None:
+            conversation_id = str(uuid.uuid4())
+        _store_conversation_state(conversation_id, updated, weights, hard_filters)
+        return ok({
+            "conversationId": conversation_id,
+            "profile": json.loads(updated.model_dump_json()),
+            "weights": json.loads(weights.model_dump_json()) if weights else None,
+            "hard_filters": json.loads(hard_filters.model_dump_json()) if hard_filters else None,
+        })
 
     # 1b) conversation turn with auto-handoff to search+reasons when ready
     @app.post("/agent/turn")
@@ -128,21 +225,51 @@ def create_app() -> Flask:
         msg = body.get("message")
         if not msg:
             return err("Missing 'message'.", 422)
-        if "profile" not in body:
-            return err("Missing 'profile'.", 422)
+        conversation_id = body.get("conversationId") or body.get("conversation_id")
+        conversation_id = str(conversation_id) if conversation_id else None
 
         # optional overrides for the next steps
         top_k = max(1, min(int(body.get("topK", app.config["MAX_RESULTS_DEFAULT"])), app.config["MAX_RESULTS_LIMIT"]))
         take = max(1, min(int(body.get("take", app.config["TAKE_DEFAULT"])), top_k))
         index = body.get("index", app.config["ES_INDEX_DEFAULT"])
 
-        profile, _, _ = parse_envelope(body)
+        profile: Profile
+        weights: Optional[Weights]
+        hard_filters: Optional[HardFilters]
+
+        if "profile" in body and isinstance(body["profile"], dict):
+            profile, weights, hard_filters = parse_envelope(body)
+        elif conversation_id:
+            loaded = _load_conversation_state(conversation_id)
+            if not loaded:
+                return err("Conversation expired or unknown. Send a full profile to continue.", 404)
+            profile, weights, hard_filters = loaded
+            _touch_conversation_state(conversation_id)
+        else:
+            return err("Missing 'profile'. Include the profile from the previous response or provide a conversationId.", 422)
+
+        if isinstance(body.get("weights"), dict):
+            try:
+                weights = Weights(**body["weights"])
+            except Exception as exc:
+                return err("Invalid 'weights' payload.", 422, {"reason": str(exc)})
+
+        if isinstance(body.get("hard_filters"), dict):
+            try:
+                hard_filters = HardFilters(**body["hard_filters"])
+            except Exception as exc:
+                return err("Invalid 'hard_filters' payload.", 422, {"reason": str(exc)})
+
         updated = stepAgent(profile=profile, message=msg)
+        if conversation_id is None:
+            conversation_id = str(uuid.uuid4())
+        _store_conversation_state(conversation_id, updated, weights, hard_filters)
         payload: Dict[str, Any] = {
             "profile": json.loads(updated.model_dump_json()),
             "ready": bool(updated.notes.get("ready")),
             "action": "recommend" if updated.notes.get("ready") else "continue"
         }
+        payload["conversationId"] = conversation_id
 
         if payload["ready"]:
             try:

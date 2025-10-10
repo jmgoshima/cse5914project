@@ -558,17 +558,26 @@ def _capture_qualitative_answers(profile: Profile, message: str) -> bool:
     text = message.lower()
     found: Dict[str, str] = {}
 
+    pending_fields: List[str] = []
+    if isinstance(profile.notes.get("pending_fields"), list):
+        pending_fields = [f for f in profile.notes["pending_fields"] if f in _QUAL_FIELD_INFO]
+    candidate_fields: List[str] = list(pending_fields)
+    if not candidate_fields:
+        last_question = profile.notes.get("next_question") or profile.notes.get("_last_question")
+        candidate_fields = _infer_fields_from_text(last_question) or []
+    if not candidate_fields:
+        candidate_fields = list(_QUAL_FIELD_INFO.keys())
+
     for raw_key, raw_value in re.findall(r"([a-z &]+?)\s*[:\-]\s*([a-z0-9\s&-]+)", text):
         field_key = _match_field_keyword(raw_key.strip())
         if not field_key:
+            continue
+        if candidate_fields and field_key not in candidate_fields:
             continue
         option = _match_option(field_key, raw_value.strip())
         if option:
             found[field_key] = option
 
-    pending_fields: List[str] = []
-    if isinstance(profile.notes.get("pending_fields"), list):
-        pending_fields = [f for f in profile.notes["pending_fields"] if f in _QUAL_FIELD_INFO]
     for field_key in pending_fields:
         if field_key in found:
             continue
