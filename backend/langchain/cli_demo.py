@@ -210,6 +210,20 @@ def run_interactive(start_profile_path: str | None) -> int:
     print("Conversation agent demo (type 'exit' to quit).")
     print(f"Agent mode: {'LLM' if _AGENT_LLM else 'Heuristic'}\n")
 
+    seeded = stepAgent_with_callback(profile, "", on_ready=query_on_ready)
+    profile = seeded["profile"]
+    initial_question = None
+    try:
+        if isinstance(profile.notes, dict):
+            turns = profile.notes.get("turns")
+            if isinstance(turns, list) and turns and not turns[0]:
+                profile.notes["turns"] = [turn for turn in turns if turn]
+            initial_question = profile.notes.get("next_question")
+    except Exception:
+        initial_question = None
+    if initial_question:
+        print(f"Agent: {initial_question}")
+
     turn = 0
     while True:
         try:

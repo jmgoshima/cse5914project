@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import List, Sequence, Union
 from dotenv import load_dotenv
 
+from qualitative import qualitative_to_numeric, get_qualitative_options
+
 env_path_relative = Path(__file__).parent.parent.parent / "elastic-start-local" / ".env"
 load_dotenv(dotenv_path=env_path_relative)
 
@@ -61,12 +63,20 @@ def _dict_to_vector(data: dict) -> List[float]:
         if value is None:
             vector.append(0.0)
             continue
+        numeric_value = value
+        if isinstance(value, str):
+            translated = qualitative_to_numeric(key, value)
+            if translated is not None:
+                numeric_value = translated
         try:
-            vector.append(float(value))
+            vector.append(float(numeric_value))
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Value for '{key}' must be numeric or null, got {value!r}."
-            ) from exc
+            message = f"Value for '{key}' must be numeric or null, got {value!r}."
+            if isinstance(value, str):
+                options = get_qualitative_options(key)
+                if options:
+                    message += f" Try one of: {', '.join(options)}."
+            raise ValueError(message) from exc
     return vector
 
 
