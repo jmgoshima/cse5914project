@@ -318,7 +318,7 @@ _QUAL_FIELD_INFO = {
         "label": "population size",
         "keywords": ["population", "size", "city size", "community size"],
         "note_key": "population",
-        "score_attr": None,
+        "score_attr": "population_min",
         "descriptions": {
             "huge": "Very large metro areas or major cities.",
             "large": "Large cities with substantial urban footprint.",
@@ -348,6 +348,20 @@ for _field_key, _info in _QUAL_FIELD_INFO.items():
         if isinstance(_kw, str) and _kw:
             _FIELD_KEYWORD_ENTRIES.append((_kw.lower(), _field_key))
 _FIELD_KEYWORD_ENTRIES.sort(key=lambda item: len(item[0]), reverse=True)
+
+_FIELD_NAME_LOOKUP: Dict[str, str] = {}
+for _field_key, _info in _QUAL_FIELD_INFO.items():
+    aliases = [
+        _field_key,
+        _info.get("dataset_field"),
+        _info.get("label"),
+        _info.get("note_key"),
+    ]
+    for alias in aliases:
+        if isinstance(alias, str) and alias:
+            alias_key = alias.lower().strip()
+            if alias_key:
+                _FIELD_NAME_LOOKUP[alias_key] = _field_key
 
 _CLIMATE_OPTIONS = list(_QUAL_FIELD_INFO["climate"]["options"])
 
@@ -631,6 +645,37 @@ def _apply_field_value(profile: Profile, field_key: str, option: str) -> None:
             setattr(profile, score_attr, numeric)
 
 
+def _normalize_qualitative_answers(profile: Profile) -> None:
+    """Ensure qualitative answers use canonical field keys and option values."""
+    if not isinstance(profile.notes, dict):
+        profile.notes = {}
+    qual_answers = profile.notes.get("qual_answers")
+    if not isinstance(qual_answers, dict):
+        return
+
+    normalized: Dict[str, Any] = {}
+    for raw_key, raw_value in list(qual_answers.items()):
+        if not isinstance(raw_key, str):
+            continue
+        lookup_key = raw_key.lower().strip()
+        field_key = _FIELD_NAME_LOOKUP.get(lookup_key, raw_key)
+        value = raw_value
+        if isinstance(raw_value, str):
+            canonical_option = _canonicalize_option(field_key, raw_value)
+            if canonical_option and canonical_option != raw_value:
+                value = canonical_option
+        normalized[field_key] = value
+
+    if not normalized:
+        return
+
+    profile.notes["qual_answers"] = normalized
+
+    for field_key, value in normalized.items():
+        if isinstance(value, str):
+            _apply_field_value(profile, field_key, value)
+
+
 def _is_field_answered(profile: Profile, field_key: str) -> bool:
     info = _QUAL_FIELD_INFO.get(field_key)
     if not info or not isinstance(profile.notes, dict):
@@ -663,6 +708,43 @@ def _question_for_field(field_key: str) -> Optional[str]:
         return f"Which climate do you prefer? Choose from: {options_list}."
     label = info.get("label", field_key)
     return f"What are your preferences for {label}? Choose from: {options_list}."
+
+
+def _cleanup_pending_fields(profile: Profile) -> None:
+    if not isinstance(profile.notes, dict):
+        profile.notes = {}
+    if "pending_fields" not in profile.notes:
+        return
+    pending = profile.notes.get("pending_fields")
+    if not pending:
+        profile.notes.pop("pending_fields", None)
+        return
+    if not isinstance(pending, list):
+        profile.notes.pop("pending_fields", None)
+        return
+    remaining: List[str] = []
+    for field_key in pending:
+        if field_key in _QUAL_FIELD_INFO and not _is_field_answered(profile, field_key):
+            remaining.append(field_key)
+    if remaining:
+        profile.notes["pending_fields"] = remaining
+    else:
+        profile.notes.pop("pending_fields", None)
+
+
+def _refresh_questionnaire_state(profile: Profile) -> None:
+    if not isinstance(profile.notes, dict):
+        profile.notes = {}
+    _cleanup_pending_fields(profile)
+    notes = profile.notes
+    if notes.get("pending_fields"):
+        return
+    next_question = notes.get("next_question")
+    if not next_question:
+        return
+    related_fields = _infer_fields_from_text(next_question)
+    if related_fields and all(_is_field_answered(profile, f) for f in related_fields):
+        notes.pop("next_question", None)
 
 
 def _determine_next_question(profile: Profile) -> Tuple[Optional[str], List[str]]:
@@ -763,6 +845,8 @@ def _heuristic_update(profile: Profile, message: str) -> Profile:
     if not isinstance(profile.notes, dict):
         profile.notes = {}
     notes = profile.notes
+    _normalize_qualitative_answers(profile)
+    _refresh_questionnaire_state(profile)
     previous_question = notes.get("next_question")
     if previous_question:
         notes["_last_question"] = previous_question
@@ -829,6 +913,8 @@ def _heuristic_update(profile: Profile, message: str) -> Profile:
         handled_binary = _handle_binary_questions(profile, incoming_message)
         if (captured_answers or handled_binary) and "next_question" in notes and not notes.get("pending_fields"):
             notes.pop("next_question", None)
+        if captured_answers or handled_binary:
+            _refresh_questionnaire_state(profile)
 
     # track message for traceability
     notes.setdefault("turns", []).append(incoming_message)
@@ -962,6 +1048,8 @@ def stepAgent(profile: Profile, message: str) -> Profile:
     # Ensure notes is a dict
     if not isinstance(merged.notes, dict):
         merged.notes = {}
+    _normalize_qualitative_answers(merged)
+    _refresh_questionnaire_state(merged)
     # Apply lightweight heuristics to fill obvious fields the model may omit
     _post_update_heuristics(merged, incoming_message, has_prev_turns)
     _set_qualitative_options_note(merged)
@@ -972,11 +1060,15 @@ def stepAgent(profile: Profile, message: str) -> Profile:
     elif not turns:
         turns.append(incoming_message)
     clarification_handled = _maybe_handle_clarification(merged, incoming_message)
+    captured_answers = False
     handled_binary = False
     if not clarification_handled:
+        captured_answers = _capture_qualitative_answers(merged, incoming_message)
         handled_binary = _handle_binary_questions(merged, incoming_message)
-        if handled_binary and "next_question" in merged.notes and not merged.notes.get("pending_fields"):
+        if (captured_answers or handled_binary) and "next_question" in merged.notes and not merged.notes.get("pending_fields"):
             merged.notes.pop("next_question", None)
+        if captured_answers or handled_binary:
+            _refresh_questionnaire_state(merged)
     qualitative_guidance = [] if clarification_handled else _ensure_qualitative_alignment(merged)
     if qualitative_guidance:
         merged.notes["next_question"] = " ".join(qualitative_guidance)

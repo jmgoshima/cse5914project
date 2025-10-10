@@ -69,7 +69,7 @@ def _profile_to_query_payload(profile: Profile) -> Dict[str, Any]:
         "Arts": notes.get("arts"),
         "Recreat": notes.get("recreation"),
         "Econ": profile.economy_score_min,
-        "Pop": profile.population_min,
+        "Pop": profile.population_min if profile.population_min is not None else notes.get("population"),
     }
     return payload
 
