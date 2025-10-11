@@ -714,9 +714,15 @@ def _question_for_field(field_key: str) -> Optional[str]:
         return None
     options_list = ", ".join(options)
     if field_key == "climate":
-        return f"Which climate do you prefer? Choose from: {options_list}."
+        return (
+            f"Which climate option best matches what you want in a new city? "
+            f"Choose from: {options_list}."
+        )
     label = info.get("label", field_key)
-    return f"What are your preferences for {label}? Choose from: {options_list}."
+    return (
+        f"Which {label} option best matches what you want in a new city? "
+        f"Choose from: {options_list}."
+    )
 
 
 def _cleanup_pending_fields(profile: Profile) -> None:
@@ -997,6 +1003,7 @@ Rules:
 - When the profile is NOT ready, include a single clear clarifying question at notes.next_question.
 - When the profile IS ready, set notes.ready=true and omit notes.next_question.
 - When gathering qualitative ratings (climate, transit, safety, healthcare, education, arts, recreation, economy, population), list the acceptable descriptors, require the user to choose from them, and if they answer with something else, ask again and repeat the acceptable options.
+- Phrase qualitative questions as preference prompts (e.g., "Which safety option best matches what you want? Choose from: ...") rather than asking "How important is ___?"
 - Acceptable qualitative descriptors:\n{QUALITATIVE_GUIDANCE_TEXT}
 - Location rules: set hard_filters.country only when the user names a country (e.g., "United States"). Set hard_filters.state only when the user explicitly mentions a state by name; otherwise leave it null. Never guess states.
  - Default scope: unless the user names a different country, assume the search is within the United States and set hard_filters.country = "United States".

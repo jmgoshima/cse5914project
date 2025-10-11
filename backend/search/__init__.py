@@ -1,0 +1,3 @@
+"""
+Search utilities package.
+"""

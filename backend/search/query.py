@@ -37,8 +37,6 @@ else:
 es = Elasticsearch("http://localhost:9200", **es_client_kwargs)
 index_name = "us_cities"
 
-city_to_search = "Random City"
-
 DATA_FIELDS: Tuple[str, ...] = (
     "Climate",
     "HousingCost",
@@ -83,6 +81,27 @@ def _load_min_max() -> Dict[str, Tuple[float, float]]:
 FIELD_MIN_MAX: Dict[str, Tuple[float, float]] = _load_min_max()
 
 EXPECTED_VECTOR_KEYS: Sequence[str] = DATA_FIELDS
+
+
+def _coerce_payload_record(payload: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(payload, list):
+        if len(payload) == 1:
+            payload = payload[0]
+        else:
+            return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _extract_city_label(payload: Any) -> Optional[str]:
+    record = _coerce_payload_record(payload)
+    if not record:
+        return None
+    value = record.get("City") or record.get("city")
+    if isinstance(value, str):
+        value = value.strip()
+    return value or None
 
 
 def _normalize_query_values(values: Sequence[Union[int, float]]) -> List[float]:
@@ -157,6 +176,22 @@ def resolve_query_vector(argv: Sequence[str]) -> List[float]:
 def main(argv: Sequence[str]) -> None:
     query_vector = resolve_query_vector(argv)
 
+    city_label: Optional[str] = None
+    payload_data: Any = None
+    if len(argv) >= 2:
+        try:
+            payload_data = json.loads(argv[1])
+        except json.JSONDecodeError:
+            payload_data = None
+    else:
+        default_path = Path(__file__).parent / "data" / "test_city.json"
+        if default_path.exists():
+            try:
+                payload_data = json.loads(default_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload_data = None
+    city_label = _extract_city_label(payload_data) if payload_data is not None else None
+
     # Run kNN to find similar cities
     response = es.search(
         index=index_name,
@@ -168,13 +203,22 @@ def main(argv: Sequence[str]) -> None:
         },
     )
 
-    # Print results (excluding the city itself)
-    print(f"Nearest neighbors to {city_to_search}:")
-    for hit in response["hits"]["hits"]:
-        city = hit["_source"]["city"]
-        score = hit["_score"]
-        if city != city_to_search:
-            print(f"  {city:20}  (score={score:.4f})")
+    # Print results (excluding the city itself when we know it)
+    display_label = city_label or "input vector"
+    print(f"Nearest neighbors to {display_label}:")
+    results = response.get("hits", {}).get("hits", [])
+    rank = 1
+    for hit in results:
+        source = hit.get("_source", {}) if isinstance(hit, dict) else {}
+        candidate_city = source.get("city") or source.get("City") or "Unknown City"
+        score = hit.get("_score")
+        if city_label and isinstance(candidate_city, str) and candidate_city.lower() == city_label.lower():
+            continue
+        if isinstance(score, (int, float)):
+            print(f"  {rank}. {candidate_city} (score={float(score):.4f})")
+        else:
+            print(f"  {rank}. {candidate_city}")
+        rank += 1
 
 
 if __name__ == "__main__":
