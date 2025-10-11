@@ -5,7 +5,7 @@ from typing import Dict
 from backend.langchain.cli_demo import _profile_to_query_payload
 from backend.langchain.schemas import Profile
 from backend.search.qualitative import qualitative_to_numeric
-from backend.search.query import buildQuery
+from backend.search.query import buildQuery, DATA_FIELDS
 
 
 def _notes_from_options(**options: str) -> Dict[str, str]:
@@ -55,6 +55,10 @@ def _profile_low_service() -> Profile:
 def test_profile_to_query_payload_maps_qualitative_answers():
     profile = _profile_low_service()
     payload = _profile_to_query_payload(profile)
+    expected_vector = buildQuery(profile, topN=5)["knn"]["query_vector"]
+
+    for index, field in enumerate(DATA_FIELDS):
+        assert payload[field] == expected_vector[index]
 
     assert payload["HlthCare"] == qualitative_to_numeric("hlthcare", "limited")
     assert payload["Crime"] == qualitative_to_numeric("crime", "dangerous")
@@ -62,7 +66,6 @@ def test_profile_to_query_payload_maps_qualitative_answers():
     assert payload["Educ"] == qualitative_to_numeric("educ", "poor")
     assert payload["Econ"] == qualitative_to_numeric("econ", "weak")
     assert payload["Pop"] == qualitative_to_numeric("pop", "small")
-    assert payload["HousingCost"] == 2000
 
 
 def test_build_query_returns_distinct_vectors_for_distinct_profiles():

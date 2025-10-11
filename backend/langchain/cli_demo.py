@@ -35,7 +35,7 @@ from backend.langchain.conversation import (
     is_profile_ready,
 )
 from backend.langchain.explain import explain
-from backend.search.qualitative import qualitative_to_numeric
+from backend.search.query import _profile_to_vector, DATA_FIELDS
 
 # Best-effort check to report whether LLM is wired up (optional)
 try:  # type: ignore[attr-defined]
@@ -59,61 +59,21 @@ USE_LLM_REASONS: bool = False
 QUERY_SCRIPT_PATH = Path(__file__).resolve().parent.parent / "search" / "query.py"
 
 def _profile_to_query_payload(profile: Profile) -> Dict[str, Any]:
+    """Return a dict aligned with DATA_FIELDS using the same scaling as query.py."""
+    vector = _profile_to_vector(profile)
+    payload: Dict[str, Any] = {}
+    for field, value in zip(DATA_FIELDS, vector):
+        payload[field] = float(value)
     notes = profile.notes if isinstance(profile.notes, dict) else {}
-    def _qual_notes(key: str) -> Optional[str]:
-        value = notes.get(key)
-        if isinstance(value, str):
-            return value
-        qual_answers = notes.get("qual_answers")
-        if isinstance(qual_answers, dict):
-            answer = qual_answers.get(key)
-            if isinstance(answer, str):
-                return answer
-        return None
-
-    def _numeric_with_fallback(attr: str, dataset_field: str, note_key: str) -> Optional[float]:
-        value = getattr(profile, attr, None)
-        if value is not None:
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError):
-                numeric = None
-            else:
-                if 0.0 <= numeric <= 1.0:
-                    return numeric * 10.0
-                return numeric
-        note_value = _qual_notes(note_key)
-        if note_value:
-            translated = qualitative_to_numeric(dataset_field, note_value)
-            if translated is not None:
-                return float(translated)
-        return None
-
-    def _population_value() -> Optional[float]:
-        if profile.population_min is not None:
-            try:
-                return float(profile.population_min)
-            except (TypeError, ValueError):
-                pass
-        note_value = _qual_notes("population")
-        if note_value:
-            translated = qualitative_to_numeric("Pop", note_value)
-            if translated is not None:
-                return float(translated)
-        return None
-
-    payload: Dict[str, Any] = {
-        "Climate": ", ".join(profile.preferred_climates) if profile.preferred_climates else _qual_notes("climate"),
-        "HousingCost": profile.housing_cost_target_max or profile.budget_monthly_usd,
-        "HlthCare": _numeric_with_fallback("healthcare_min_score", "HlthCare", "healthcare"),
-        "Crime": _numeric_with_fallback("safety_min_score", "Crime", "safety"),
-        "Transp": _numeric_with_fallback("transit_min_score", "Transp", "transit"),
-        "Educ": _numeric_with_fallback("education_min_score", "Educ", "education"),
-        "Arts": _qual_notes("arts"),
-        "Recreat": _qual_notes("recreation"),
-        "Econ": _numeric_with_fallback("economy_score_min", "Econ", "economy"),
-        "Pop": _population_value(),
-    }
+    city_label = None
+    if isinstance(notes.get("qual_answers"), dict):
+        city_label = notes["qual_answers"].get("city")
+    if not city_label:
+        direct_city = notes.get("city")
+        if isinstance(direct_city, str):
+            city_label = direct_city
+    if city_label:
+        payload["City"] = city_label
     return payload
 
 def _parse_query_output(raw_output: str) -> Dict[str, Any]:
