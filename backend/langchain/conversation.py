@@ -684,6 +684,43 @@ def _normalize_qualitative_answers(profile: Profile) -> None:
         if isinstance(value, str):
             _apply_field_value(profile, field_key, value)
 
+    # Also normalize any alias keys the LLM may have added directly onto notes
+    for field_key, info in _QUAL_FIELD_INFO.items():
+        note_key = info.get("note_key")
+        if not note_key:
+            continue
+        if isinstance(profile.notes.get(note_key), str):
+            continue
+        label = info.get("label") or ""
+        dataset_field = info.get("dataset_field") or ""
+        candidate_keys = {
+            label,
+            label.lower(),
+            dataset_field,
+            dataset_field.lower(),
+            re.sub(r"[^a-z0-9]+", "_", label.lower()),
+            re.sub(r"[^a-z0-9]+", "", label.lower()),
+            re.sub(r"[^a-z0-9]+", " ", label.lower()).strip(),
+            label.replace("&", "and"),
+            label.replace("&", "").strip(),
+        }
+        candidate_keys = {str(k).strip() for k in candidate_keys if isinstance(k, str) and k}
+        for alias in candidate_keys:
+            if alias == note_key:
+                continue
+            value = profile.notes.get(alias)
+            if not isinstance(value, str):
+                continue
+            canonical = _canonicalize_option(field_key, value) or _canonicalize_option(field_key, value.lower())
+            if canonical:
+                _apply_field_value(profile, field_key, canonical)
+                if alias != note_key:
+                    try:
+                        profile.notes.pop(alias, None)
+                    except Exception:
+                        pass
+                break
+
 
 def _is_field_answered(profile: Profile, field_key: str) -> bool:
     info = _QUAL_FIELD_INFO.get(field_key)
