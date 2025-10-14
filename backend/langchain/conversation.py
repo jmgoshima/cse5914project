@@ -563,8 +563,11 @@ def _capture_qualitative_answers(profile: Profile, message: str) -> bool:
         pending_fields = [f for f in profile.notes["pending_fields"] if f in _QUAL_FIELD_INFO]
     candidate_fields: List[str] = list(pending_fields)
     if not candidate_fields:
-        last_question = profile.notes.get("next_question") or profile.notes.get("_last_question")
-        candidate_fields = _infer_fields_from_text(last_question) or []
+        awaiting_question = profile.notes.get("_awaiting_question")
+        last_question = profile.notes.get("_last_question")
+        next_question = profile.notes.get("next_question")
+        question_text = awaiting_question or last_question or next_question
+        candidate_fields = _infer_fields_from_text(question_text) or []
     if not candidate_fields:
         candidate_fields = list(_QUAL_FIELD_INFO.keys())
 
@@ -585,8 +588,19 @@ def _capture_qualitative_answers(profile: Profile, message: str) -> bool:
         if option:
             found[field_key] = option
 
+    if candidate_fields:
+        for field_key in candidate_fields:
+            if field_key in pending_fields or field_key in found:
+                continue
+            option = _match_option(field_key, text)
+            if option:
+                found[field_key] = option
+
     if not found:
         return False
+
+    if profile.notes.get("_awaiting_question"):
+        profile.notes.pop("_awaiting_question", None)
 
     profile.notes.setdefault("qual_answers", {})
     for field_key, option in found.items():
@@ -1067,6 +1081,7 @@ def stepAgent(profile: Profile, message: str) -> Profile:
         profile.notes = {}
     notes = profile.notes
     has_prev_turns = bool(notes.get("turns"))
+    previous_question = notes.get("next_question") or notes.get("_last_question")
 
     if not (_LLM and _PARSER and _PROMPT):
         return _heuristic_update(profile, incoming_message)
@@ -1101,6 +1116,8 @@ def stepAgent(profile: Profile, message: str) -> Profile:
     # Ensure notes is a dict
     if not isinstance(merged.notes, dict):
         merged.notes = {}
+    if previous_question:
+        merged.notes["_awaiting_question"] = previous_question
     _normalize_qualitative_answers(merged)
     _refresh_questionnaire_state(merged)
     # Apply lightweight heuristics to fill obvious fields the model may omit
