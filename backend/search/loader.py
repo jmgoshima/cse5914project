@@ -1,10 +1,17 @@
-from elasticsearch import Elasticsearch, helpers
+from elasticsearch import helpers
 from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from dotenv import load_dotenv
 import os
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
+from backend.search.es_client import get_client  # type: ignore
 
 # 0. load .env variables from elastic-start-local
 
@@ -53,9 +60,8 @@ min_max_df.to_csv(Path(__file__).parent / "data" / "places_min_max.csv", index=F
 
 
 # 2. Loading data into elastic search
-#df = pd.read_csv("data/places.csv")
 index_name = "us_cities"
-es = Elasticsearch('http://localhost:9200', basic_auth=('elastic', os.getenv("ES_LOCAL_PASSWORD")), verify_certs=False)
+es = get_client()
 
 # Define mapping for the index
 dims = len(min_max_df.columns) - 1  # exclude "City" column

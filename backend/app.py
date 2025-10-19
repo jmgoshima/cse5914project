@@ -1,17 +1,17 @@
 from __future__ import annotations
-import os, json, uuid, threading
+import os, json, uuid, threading, queue
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
-from flask import Flask, jsonify, request, g
+from typing import Any, Callable, Dict, Optional, Tuple
+from flask import Flask, jsonify, request, g, Blueprint, Response, stream_with_context
 from flask_cors import CORS
 
 # ---- your modules (heavy lifting lives here) ----
-from langchain.conversation import stepAgent             # agent: fills Profile
-from langchain.explain import explain                    # generic LLM call used for "reasons"
-from langchain.schemas import Profile, Weights, HardFilters
-from search.query import buildQuery                      # build ES query from Profile
-from search.es_client import get_client                  # ES client factory
-from utils.cache import get_cache                        # cache (redis or in-memory)
+from backend.langchain.conversation import stepAgent             # agent: fills Profile
+from backend.langchain.explain import explain                    # generic LLM call used for "reasons"
+from backend.langchain.schemas import Profile, Weights, HardFilters
+from backend.search.query import buildQuery                      # build ES query from Profile
+from backend.search.es_client import get_client                  # ES client factory
+from backend.utils.cache import get_cache                        # cache (redis or in-memory)
 # --------------------------------------------------
 
 def create_app() -> Flask:
@@ -26,10 +26,13 @@ def create_app() -> Flask:
         CONVERSATION_TTL_SECONDS=int(os.getenv("CONVERSATION_TTL_SECONDS", "900")),
     )
 
+    api = Blueprint("api", __name__, url_prefix="/api")
+
     CORS(app, resources={r"/*": {"origins": app.config["CORS_ORIGINS"]}})
 
     _es, _cache = None, None
     _conversation_state: Dict[str, Dict[str, Any]] = {}
+    _event_streams: Dict[str, queue.Queue] = {}
     _conversation_lock = threading.Lock()
     def es():
         nonlocal _es
@@ -42,6 +45,32 @@ def create_app() -> Flask:
             _cache = get_cache()
         return _cache
 
+    def _get_stream_queue(conversation_id: str) -> queue.Queue:
+        with _conversation_lock:
+            q = _event_streams.get(conversation_id)
+            if q is None:
+                q = queue.Queue()
+                _event_streams[conversation_id] = q
+            return q
+
+    def _close_stream(conversation_id: str) -> None:
+        with _conversation_lock:
+            q = _event_streams.pop(conversation_id, None)
+        if q:
+            q.put(None)
+
+    def _publish_event(conversation_id: Optional[str], event: str, data: Dict[str, Any]) -> None:
+        if not conversation_id:
+            return
+        try:
+            q = _get_stream_queue(conversation_id)
+            q.put({"event": event, "data": data})
+        except Exception:
+            pass
+
+    def _format_event(event: str, data: Dict[str, Any]) -> str:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
     def _load_conversation_state(conversation_id: str) -> Optional[Tuple[Profile, Optional[Weights], Optional[HardFilters]]]:
         if not conversation_id:
             return None
@@ -52,6 +81,7 @@ def create_app() -> Flask:
             expires_at = state.get("expires_at")
             if isinstance(expires_at, datetime) and expires_at <= datetime.utcnow():
                 _conversation_state.pop(conversation_id, None)
+                _close_stream(conversation_id)
                 return None
             state = dict(state)
         try:
@@ -115,18 +145,23 @@ def create_app() -> Flask:
         return p, w, h
 
     # --- internal helper used by /recommend and agent auto-flow ---
-    def _recommend_for_profile(profile: Profile, top_k: int, take: int, index: str):
+    def _recommend_for_profile(profile: Profile, top_k: int, take: int, index: str, progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None):
         query = buildQuery(profile=profile, topN=top_k)
+        if progress_cb:
+            progress_cb("search_started", {"topK": top_k, "index": index})
         try:
             resp = es().search(index=index, body=query, from_=0, size=top_k)
         except Exception as e:
             raise RuntimeError(f"Elasticsearch query failed: {e}")
 
-        hits = (resp.get("hits", {}).get("hits", []) or [])[:take]
+        all_hits = resp.get("hits", {}).get("hits", []) or []
+        hits = all_hits[:take]
+        if progress_cb:
+            progress_cb("search_complete", {"found": len(all_hits), "returning": len(hits)})
 
         def make_reason(src: Dict[str, Any]) -> str:
             prompt = (
-                "You are a relocation advisor. In 2–4 sentences, explain why this city fits the user's preferences. "
+                "You are a relocation advisor. In 2-4 sentences, explain why this city fits the user's preferences. "
                 "Reference cost of living, climate, safety, job market, and lifestyle if available. "
                 "No markdown, no lists.\n\n"
                 f"USER_PROFILE_JSON:\n{profile.model_dump_json()}\n\nCITY_FACTS_JSON:\n{json.dumps(src, ensure_ascii=False)}\n\nREASON:"
@@ -134,9 +169,12 @@ def create_app() -> Flask:
             return explain(prompt).strip()
 
         cities = []
-        for h in hits:
+        if progress_cb and hits:
+            progress_cb("reasoning_started", {"count": len(hits)})
+        profile_hash = hash(profile.model_dump_json())
+        for idx, h in enumerate(hits):
             src = h.get("_source", {})
-            cache_key = f"reason:{h.get('_id')}:{hash(profile.model_dump_json())}"
+            cache_key = f"reason:{h.get('_id')}:{profile_hash}"
             reason = cache().get(cache_key) or make_reason(src)
             try:
                 cache().set(cache_key, reason, ex=app.config["CACHE_TTL_SECONDS"])
@@ -149,6 +187,10 @@ def create_app() -> Flask:
                 "source": src,
                 "reason": reason
             })
+            if progress_cb:
+                progress_cb("reasoning_progress", {"current": idx + 1, "total": len(hits)})
+        if progress_cb:
+            progress_cb("reasoning_complete", {"count": len(cities)})
 
         return {
             "count": len(cities),
@@ -170,8 +212,8 @@ def create_app() -> Flask:
         return ok({"status": "up", "time": datetime.utcnow().isoformat() + "Z", "elasticsearch": "up" if es_ok else "down"})
 
     # 1) conversation: agent fills profile
-    @app.post("/conversation/step")
-    def conversation_step():
+    @api.post("/userStep")
+    def user_step():
         body = request.get_json(silent=True) or {}
         msg = body.get("message")
         if not msg:
@@ -211,16 +253,18 @@ def create_app() -> Flask:
         if conversation_id is None:
             conversation_id = str(uuid.uuid4())
         _store_conversation_state(conversation_id, updated, weights, hard_filters)
-        return ok({
+        response_payload = {
             "conversationId": conversation_id,
             "profile": json.loads(updated.model_dump_json()),
             "weights": json.loads(weights.model_dump_json()) if weights else None,
             "hard_filters": json.loads(hard_filters.model_dump_json()) if hard_filters else None,
-        })
+        }
+        _publish_event(conversation_id, "status", {"stage": "profile_updated", "ready": bool(updated.notes.get("ready"))})
+        return ok(response_payload)
 
     # 1b) conversation turn with auto-handoff to search+reasons when ready
-    @app.post("/agent/turn")
-    def agent_turn():
+    @api.post("/chat")
+    def chat_turn():
         body = request.get_json(silent=True) or {}
         msg = body.get("message")
         if not msg:
@@ -264,6 +308,7 @@ def create_app() -> Flask:
         if conversation_id is None:
             conversation_id = str(uuid.uuid4())
         _store_conversation_state(conversation_id, updated, weights, hard_filters)
+        _publish_event(conversation_id, "status", {"stage": "agent_updated", "ready": bool(updated.notes.get("ready"))})
         payload: Dict[str, Any] = {
             "profile": json.loads(updated.model_dump_json()),
             "ready": bool(updated.notes.get("ready")),
@@ -272,16 +317,50 @@ def create_app() -> Flask:
         payload["conversationId"] = conversation_id
 
         if payload["ready"]:
+            def _progress(stage: str, info: Dict[str, Any]) -> None:
+                _publish_event(conversation_id, "status", {"stage": stage, **info})
+
+            _publish_event(conversation_id, "status", {"stage": "searching", "topK": top_k, "take": take, "index": index})
             try:
-                rec = _recommend_for_profile(updated, top_k=top_k, take=take, index=index)
+                rec = _recommend_for_profile(updated, top_k=top_k, take=take, index=index, progress_cb=_progress)
                 payload.update(rec)
+                _publish_event(conversation_id, "status", {"stage": "results_ready", "count": rec.get("count", 0)})
             except RuntimeError as e:
+                _publish_event(conversation_id, "status", {"stage": "error", "message": str(e)})
                 return err("Elasticsearch query failed.", 502, {"reason": str(e)})
+        else:
+            _publish_event(conversation_id, "status", {"stage": "collecting_requirements"})
 
         return ok(payload)
 
+    @api.get("/stream")
+    def stream_events():
+        conversation_id = request.args.get("session_id") or request.args.get("conversationId") or request.args.get("conversation_id")
+        if not conversation_id:
+            return err("Missing 'session_id'.", 422)
+        event_queue = _get_stream_queue(conversation_id)
+
+        def _event_source():
+            yield _format_event("status", {"stage": "connected"})
+            while True:
+                try:
+                    item = event_queue.get(timeout=15)
+                except queue.Empty:
+                    yield "event: ping\ndata: {}\n\n"
+                    continue
+                if item is None:
+                    break
+                event_name = item.get("event") or "message"
+                data = item.get("data") or {}
+                yield _format_event(event_name, data)
+
+        response = Response(stream_with_context(_event_source()), mimetype="text/event-stream")
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["X-Accel-Buffering"] = "no"
+        return response
+
     # 2) search: ES top-k cities from profile
-    @app.post("/search/places")
+    @api.post("/search/places")
     def search_places():
         body = request.get_json(silent=True) or {}
         if "profile" not in body:
@@ -301,7 +380,7 @@ def create_app() -> Flask:
         return ok({"total": total, "count": len(results), "from": offset, "results": results, "raw_query": query})
 
     # 3) recommend: ES → take top N → LLM adds reasons
-    @app.post("/recommend")
+    @api.post("/recommend")
     def recommend():
         body = request.get_json(silent=True) or {}
         if "profile" not in body:
@@ -320,6 +399,8 @@ def create_app() -> Flask:
             "profile": json.loads(profile.model_dump_json()),
             **rec
         })
+
+    app.register_blueprint(api)
 
     return app
 
