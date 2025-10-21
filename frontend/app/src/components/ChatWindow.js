@@ -39,9 +39,11 @@ function ChatWindow({ messages, isTyping }) {
         </div>
       ))}
       {isTyping && (
-        <div className="bot-row message-row">
+        <div className="message-row bot-row">
           <div className="avatar bot-avatar">🤖</div>
-          <div className="message-bubble bot-bubble">Typing...</div>
+          <div className="message-bubble bot-bubble typing">
+            <span>.</span><span>.</span><span>.</span>
+          </div>
         </div>
       )}
       <div ref={endRef} />

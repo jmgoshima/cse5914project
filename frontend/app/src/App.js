@@ -10,17 +10,31 @@ function App() {
 
   const [isTyping, setIsTyping] = useState(false);
 
-  const handleSend = (message) => {
+  const handleSend = async (message) => {
+    // Add user message
     setMessages((prev) => [...prev, { sender: "user", text: message }]);
+
+    // show typing indicator
     setIsTyping(true);
 
-    setTimeout(() => {
+    try {
+      // Example call to your backend (or any test API)
+      const response = await fetch("https://api.adviceslip.com/advice");
+      const data = await response.json();
+
+      // Use the advice as the bot's message
+      const botReply = data.slip.advice;
+
+      setMessages((prev) => [...prev, { sender: "bot", text: botReply }]);
+    } catch (err) {
+      console.error(err);
       setMessages((prev) => [
         ...prev,
-        { sender: "bot", text: "I'm just a demo bot 🤖" },
+        { sender: "bot", text: "Sorry, something went wrong 😢" },
       ]);
+    } finally {
       setIsTyping(false);
-    }, 1000);
+    }
   };
 
   return (
