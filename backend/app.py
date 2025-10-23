@@ -210,6 +210,7 @@ def create_app() -> Flask:
         except Exception:
             es_ok = False
         return ok({"status": "up", "time": datetime.utcnow().isoformat() + "Z", "elasticsearch": "up" if es_ok else "down"})
+    
 
     # 1) conversation: agent fills profile
     @api.post("/userStep")
@@ -262,76 +263,161 @@ def create_app() -> Flask:
         _publish_event(conversation_id, "status", {"stage": "profile_updated", "ready": bool(updated.notes.get("ready"))})
         return ok(response_payload)
 
+    # initialize the api 
+    @api.post("/initialize")
+    def initialize():
+        conversation_id = str(uuid.uuid4())
+        with _conversation_lock:
+            _conversation_state[conversation_id] = {
+                "profile": Profile().model_dump_json(),
+                "weights": None,
+                "hard_filters": None,
+                "history": [],
+                "expires_at": datetime.utcnow() + timedelta(seconds=app.config["CONVERSATION_TTL_SECONDS"])
+            }
+        _publish_event(conversation_id, "status", {"stage": "initialized"})
+        return ok({
+            "conversationId": conversation_id,
+            "history": [],
+            "message": "Conversation initialized successfully."
+        })
+    
+
     # 1b) conversation turn with auto-handoff to search+reasons when ready
     @api.post("/chat")
     def chat_turn():
         body = request.get_json(silent=True) or {}
-        msg = body.get("message")
-        if not msg:
+        message = body.get("message")
+        conversation_id = body.get("conversationId")
+
+        if not message:
             return err("Missing 'message'.", 422)
-        conversation_id = body.get("conversationId") or body.get("conversation_id")
-        conversation_id = str(conversation_id) if conversation_id else None
+        if not conversation_id:
+            return err("Missing 'conversationId'.", 422)
 
-        # optional overrides for the next steps
-        top_k = max(1, min(int(body.get("topK", app.config["MAX_RESULTS_DEFAULT"])), app.config["MAX_RESULTS_LIMIT"]))
-        take = max(1, min(int(body.get("take", app.config["TAKE_DEFAULT"])), top_k))
-        index = body.get("index", app.config["ES_INDEX_DEFAULT"])
+        loaded = _load_conversation_state(conversation_id)
+        if not loaded:
+            return err("Conversation not found or expired.", 404)
 
-        profile: Profile
-        weights: Optional[Weights]
-        hard_filters: Optional[HardFilters]
+        profile, weights, hard_filters = loaded
+        _touch_conversation_state(conversation_id)
 
-        if "profile" in body and isinstance(body["profile"], dict):
-            profile, weights, hard_filters = parse_envelope(body)
-        elif conversation_id:
-            loaded = _load_conversation_state(conversation_id)
-            if not loaded:
-                return err("Conversation expired or unknown. Send a full profile to continue.", 404)
-            profile, weights, hard_filters = loaded
-            _touch_conversation_state(conversation_id)
-        else:
-            return err("Missing 'profile'. Include the profile from the previous response or provide a conversationId.", 422)
+        # Retrieve conversation history if present
+        with _conversation_lock:
+            state = _conversation_state.get(conversation_id, {})
+            history = state.get("history", [])
 
-        if isinstance(body.get("weights"), dict):
-            try:
-                weights = Weights(**body["weights"])
-            except Exception as exc:
-                return err("Invalid 'weights' payload.", 422, {"reason": str(exc)})
+        # Append user message
+        history.append({"role": "user", "content": message})
 
-        if isinstance(body.get("hard_filters"), dict):
-            try:
-                hard_filters = HardFilters(**body["hard_filters"])
-            except Exception as exc:
-                return err("Invalid 'hard_filters' payload.", 422, {"reason": str(exc)})
+        # Use LLM agent to get next step
+        updated_profile = stepAgent(profile=profile, message=message)
 
-        updated = stepAgent(profile=profile, message=msg)
-        if conversation_id is None:
-            conversation_id = str(uuid.uuid4())
-        _store_conversation_state(conversation_id, updated, weights, hard_filters)
-        _publish_event(conversation_id, "status", {"stage": "agent_updated", "ready": bool(updated.notes.get("ready"))})
-        payload: Dict[str, Any] = {
-            "profile": json.loads(updated.model_dump_json()),
-            "ready": bool(updated.notes.get("ready")),
-            "action": "recommend" if updated.notes.get("ready") else "continue"
+        # Add system/agent response
+        response_text = updated_profile.notes.get("response", "Profile updated.")
+        history.append({"role": "assistant", "content": response_text})
+
+        # Save back to conversation state
+        with _conversation_lock:
+            _conversation_state[conversation_id]["profile"] = updated_profile.model_dump_json()
+            _conversation_state[conversation_id]["history"] = history
+            _conversation_state[conversation_id]["expires_at"] = datetime.utcnow() + timedelta(seconds=app.config["CONVERSATION_TTL_SECONDS"])
+
+        payload = {
+            "conversationId": conversation_id,
+            "response": response_text,
+            "profile": json.loads(updated_profile.model_dump_json()),
+            "history": history,
+            "ready": bool(updated_profile.notes.get("ready")),
         }
-        payload["conversationId"] = conversation_id
 
+        # Optionally trigger recommendation when ready
         if payload["ready"]:
-            def _progress(stage: str, info: Dict[str, Any]) -> None:
-                _publish_event(conversation_id, "status", {"stage": stage, **info})
-
-            _publish_event(conversation_id, "status", {"stage": "searching", "topK": top_k, "take": take, "index": index})
+            _publish_event(conversation_id, "status", {"stage": "searching"})
             try:
-                rec = _recommend_for_profile(updated, top_k=top_k, take=take, index=index, progress_cb=_progress)
-                payload.update(rec)
-                _publish_event(conversation_id, "status", {"stage": "results_ready", "count": rec.get("count", 0)})
+                rec = _recommend_for_profile(updated_profile, top_k=10, take=5, index=app.config["ES_INDEX_DEFAULT"])
+                payload["recommendations"] = rec
+                _publish_event(conversation_id, "status", {"stage": "results_ready"})
             except RuntimeError as e:
-                _publish_event(conversation_id, "status", {"stage": "error", "message": str(e)})
                 return err("Elasticsearch query failed.", 502, {"reason": str(e)})
-        else:
-            _publish_event(conversation_id, "status", {"stage": "collecting_requirements"})
 
         return ok(payload)
+
+    # @api.post("/chat")
+    # def chat_turn():
+    #     body = request.get_json(silent=True) or {}
+    #     msg = body.get("message")
+    #     #conversation_id = body.get("conversationId")
+    #     if not msg:
+    #         return err("Missing 'message'.", 422)
+    #     conversation_id = body.get("conversationId") or body.get("conversation_id")
+    #     conversation_id = str(conversation_id) if conversation_id else None
+        
+    #     loaded = _load_conversation_state(conversation_id)
+    #     if not loaded:
+    #         return err("Conversation not found or expired.", 404)
+        
+    #     # optional overrides for the next steps
+    #     top_k = max(1, min(int(body.get("topK", app.config["MAX_RESULTS_DEFAULT"])), app.config["MAX_RESULTS_LIMIT"]))
+    #     take = max(1, min(int(body.get("take", app.config["TAKE_DEFAULT"])), top_k))
+    #     index = body.get("index", app.config["ES_INDEX_DEFAULT"])
+
+    #     profile: Profile
+    #     weights: Optional[Weights]
+    #     hard_filters: Optional[HardFilters]
+
+    #     if "profile" in body and isinstance(body["profile"], dict):
+    #         profile, weights, hard_filters = parse_envelope(body)
+    #     elif conversation_id:
+    #         loaded = _load_conversation_state(conversation_id)
+    #         if not loaded:
+    #             return err("Conversation expired or unknown. Send a full profile to continue.", 404)
+    #         profile, weights, hard_filters = loaded
+    #         _touch_conversation_state(conversation_id)
+    #     else:
+    #         return err("Missing 'profile'. Include the profile from the previous response or provide a conversationId.", 422)
+
+    #     if isinstance(body.get("weights"), dict):
+    #         try:
+    #             weights = Weights(**body["weights"])
+    #         except Exception as exc:
+    #             return err("Invalid 'weights' payload.", 422, {"reason": str(exc)})
+
+    #     if isinstance(body.get("hard_filters"), dict):
+    #         try:
+    #             hard_filters = HardFilters(**body["hard_filters"])
+    #         except Exception as exc:
+    #             return err("Invalid 'hard_filters' payload.", 422, {"reason": str(exc)})
+
+    #     updated = stepAgent(profile=profile, message=msg)
+    #     if conversation_id is None:
+    #         conversation_id = str(uuid.uuid4())
+    #     _store_conversation_state(conversation_id, updated, weights, hard_filters)
+    #     _publish_event(conversation_id, "status", {"stage": "agent_updated", "ready": bool(updated.notes.get("ready"))})
+    #     payload: Dict[str, Any] = {
+    #         #"conversationId": conversation_id,
+    #         "profile": json.loads(updated.model_dump_json()),
+    #         "ready": bool(updated.notes.get("ready")),
+    #         "action": "recommend" if updated.notes.get("ready") else "continue"
+    #     }
+    #     payload["conversationId"] = conversation_id
+
+    #     if payload["ready"]:
+    #         def _progress(stage: str, info: Dict[str, Any]) -> None:
+    #             _publish_event(conversation_id, "status", {"stage": stage, **info})
+
+    #         _publish_event(conversation_id, "status", {"stage": "searching", "topK": top_k, "take": take, "index": index})
+    #         try:
+    #             rec = _recommend_for_profile(updated, top_k=top_k, take=take, index=index, progress_cb=_progress)
+    #             payload.update(rec)
+    #             _publish_event(conversation_id, "status", {"stage": "results_ready", "count": rec.get("count", 0)})
+    #         except RuntimeError as e:
+    #             _publish_event(conversation_id, "status", {"stage": "error", "message": str(e)})
+    #             return err("Elasticsearch query failed.", 502, {"reason": str(e)})
+    #     else:
+    #         _publish_event(conversation_id, "status", {"stage": "collecting_requirements"})
+
+    #     return ok(payload)
 
     @api.get("/stream")
     def stream_events():
