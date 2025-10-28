@@ -47,6 +47,80 @@
 
 // export default App;
 
+// import React, { useState, useEffect } from "react";
+// import ChatWindow from "./components/ChatWindow";
+// import ChatInput from "./components/ChatInput";
+// import "./App.css";
+
+// function App() {
+//   const [messages, setMessages] = useState([
+//     { sender: "bot", text: "Hello! How can I help you today?" },
+//   ]);
+//   const [isTyping, setIsTyping] = useState(false);
+//   const [conversationID, setConversationID] = useState(null);
+
+//   // Initialize conversation when app starts
+//   useEffect(() => {
+//     const initializeConversation = async () => {
+//       try {
+//         const response = await fetch("http://localhost:8080/api/initialize", {
+//           method: "POST",
+//         });
+//         const data = await response.json();
+//         setConversationID(data.data.conversationId);
+//         console.log("Conversation initialized:", data.conversationID);
+//       } catch (err) {
+//         console.error("Initialization failed:", err);
+//       }
+//     };
+
+//     initializeConversation();
+//   }, []);
+
+//   const handleSend = async (message) => {
+//     // Add user's message to chat window
+//     setMessages((prev) => [...prev, { sender: "user", text: message }]);
+//     setIsTyping(true);
+
+//     try {
+//       const response = await fetch("http://localhost:8080/api/chat", {
+//         method: "POST",
+//         headers: {
+//           "Content-Type": "application/json",
+//         },
+//         body: JSON.stringify({
+//           conversationId: conversationID,
+//           message: message,
+//         }),
+//       });
+
+//       const data = await response.json();
+
+//       // Assuming backend returns: { reply: "...", metadata: {...} }
+//       const botReply = data.data.response|| "Hmm, I didn’t understand that.";
+
+//       setMessages((prev) => [...prev, { sender: "bot", text: botReply }]);
+//     } catch (err) {
+//       console.error("Chat request failed:", err);
+//       setMessages((prev) => [
+//         ...prev,
+//         { sender: "bot", text: "Sorry, something went wrong 😢" },
+//       ]);
+//     } finally {
+//       setIsTyping(false);
+//     }
+//   };
+
+//   return (
+//     <div className="chat-container">
+//       <ChatWindow messages={messages} isTyping={isTyping} />
+//       <ChatInput onSend={handleSend} />
+//     </div>
+//   );
+// }
+
+// export default App;
+
 import React, { useState, useEffect } from "react";
 import ChatWindow from "./components/ChatWindow";
 import ChatInput from "./components/ChatInput";
@@ -63,12 +137,20 @@ function App() {
   useEffect(() => {
     const initializeConversation = async () => {
       try {
-        const response = await fetch("http://localhost:5000/api/initialize", {
+        const response = await fetch("http://localhost:8080/api/initialize", {
           method: "POST",
         });
         const data = await response.json();
-        setConversationID(data.conversationID);
-        console.log("Conversation initialized:", data.conversationID);
+
+        // Correctly read the nested conversationId
+        const convId = data?.data?.conversationId;
+        if (!convId) {
+          console.error("No conversationId returned:", data);
+          return;
+        }
+
+        setConversationID(convId);
+        console.log("Conversation initialized:", convId);
       } catch (err) {
         console.error("Initialization failed:", err);
       }
@@ -78,26 +160,36 @@ function App() {
   }, []);
 
   const handleSend = async (message) => {
+    if (!conversationID) {
+      console.error("No conversation ID yet; cannot send message.");
+      return;
+    }
+
     // Add user's message to chat window
     setMessages((prev) => [...prev, { sender: "user", text: message }]);
     setIsTyping(true);
 
     try {
-      const response = await fetch("http://localhost:5000/api/chat", {
+      const response = await fetch("http://localhost:8080/api/chat", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          conversationID: conversationID,
-          userInput: message,
+          conversationId: conversationID, // matches backend key
+          message: message,
         }),
       });
 
       const data = await response.json();
 
-      // Assuming backend returns: { reply: "...", metadata: {...} }
-      const botReply = data.reply || "Hmm, I didn’t understand that.";
+      // backend returns response in data.response
+      const botReply = data?.data?.response || "Hmm, I didn’t understand that.";
+
+      // Optionally include recommendations in messages
+      if (data?.data?.recommendations) {
+        console.log("Recommendations:", data.data.recommendations);
+      }
 
       setMessages((prev) => [...prev, { sender: "bot", text: botReply }]);
     } catch (err) {
@@ -120,3 +212,4 @@ function App() {
 }
 
 export default App;
+
