@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import ChatWindow from "./components/ChatWindow";
 import ChatInput from "./components/ChatInput";
+import CityRecommendations from "./components/CityRecommendations";
 import "./App.css";
 
 const HOW_TO_STEPS = [
@@ -9,48 +10,13 @@ const HOW_TO_STEPS = [
   "Ask follow-up questions until you have next steps you're ready to act on.",
 ];
 
-const extractCityRecommendations = (payload) => {
-  if (!payload || typeof payload !== "object") {
-    return [];
-  }
-
-  if (Array.isArray(payload.cities)) {
-    return payload.cities;
-  }
-
-  if (Array.isArray(payload?.data?.cities)) {
-    return payload.data.cities;
-  }
-
-  if (Array.isArray(payload?.data?.data?.cities)) {
-    return payload.data.data.cities;
-  }
-
-  return [];
-};
-
-const isRecommendationReady = (payload) => {
-  if (!payload || typeof payload !== "object") {
-    return false;
-  }
-
-  if (typeof payload.ready === "boolean") {
-    return payload.ready;
-  }
-
-  if (typeof payload?.data?.ready === "boolean") {
-    return payload.data.ready;
-  }
-
-  return false;
-};
-
 function App() {
   const [messages, setMessages] = useState([
     { sender: "bot", text: "Hello! How can I help you today?" },
   ]);
   const [isTyping, setIsTyping] = useState(false);
-  const [cityRecommendations, setCityRecommendations] = useState([]);
+  const [cityResult, setCityResult] = useState(null);
+  const [isWaitingForCity, setIsWaitingForCity] = useState(false);
 
   const handleSend = async (message) => {
     if (!message.trim()) {
@@ -59,6 +25,7 @@ function App() {
 
     setMessages((prev) => [...prev, { sender: "user", text: message }]);
     setIsTyping(true);
+    setIsWaitingForCity(true);
 
     try {
       const response = await fetch("https://api.adviceslip.com/advice");
@@ -69,11 +36,22 @@ function App() {
         data?.data?.message ||
         "Here's something to consider.";
 
-      const recommendedCities = extractCityRecommendations(data);
-      if (recommendedCities.length > 0) {
-        setCityRecommendations(recommendedCities);
-      } else if (isRecommendationReady(data)) {
-        setCityRecommendations([]);
+      const recommendationPayload =
+        data?.city_recommendations || data?.data?.city_recommendations || data;
+
+      if (
+        recommendationPayload?.raw_output ||
+        recommendationPayload?.cities ||
+        recommendationPayload?.profile_payload
+      ) {
+        setCityResult({
+          header: recommendationPayload.header,
+          raw_output: recommendationPayload.raw_output,
+          cities: recommendationPayload.cities,
+          profile_payload: recommendationPayload.profile_payload,
+        });
+      } else {
+        setCityResult(null);
       }
 
       setMessages((prev) => [...prev, { sender: "bot", text: botReply }]);
@@ -85,6 +63,7 @@ function App() {
       ]);
     } finally {
       setIsTyping(false);
+      setIsWaitingForCity(false);
     }
   };
 
@@ -106,71 +85,49 @@ function App() {
           </p>
         </section>
 
-        <section className="content-grid">
-          <div className="info-column">
-            <div className="how-to-card">
+        <section className="dashboard">
+          <div className="how-to-row">
+            <div className="how-to-heading">
               <h2>How to get the most out of it</h2>
-              <ol>
-                {HOW_TO_STEPS.map((step, index) => (
-                  <li key={index}>
-                    <span className="step-number">{index + 1}</span>
-                    <p>{step}</p>
-                  </li>
-                ))}
-              </ol>
+              <p>Three quick steps to start a productive session.</p>
             </div>
-
-            <div className="recommendations-card">
-              <h2>City recommendations</h2>
-              <p className="recommendations-hint">
-                Once the assistant finishes gathering details, your tailored
-                cities will appear here.
-              </p>
-              {cityRecommendations.length > 0 ? (
-                <ul className="city-list">
-                  {cityRecommendations.map((city, idx) => {
-                    const key = city?.id || `${city?.name ?? "city"}-${idx}`;
-                    const reason =
-                      city?.reason ||
-                      city?.summary ||
-                      city?.description ||
-                      city?.notes ||
-                      "Details coming soon.";
-                    return (
-                      <li key={key} className="city-item">
-                        <div className="city-name">
-                          {city?.name || "Unnamed city"}
-                        </div>
-                        {reason && <p className="city-reason">{reason}</p>}
-                      </li>
-                    );
-                  })}
-                </ul>
-              ) : (
-                <div className="city-placeholder">
-                  <span className="city-placeholder-dot" />
-                  <span className="city-placeholder-text">
-                    No recommendations yet - start chatting to unlock them.
-                  </span>
-                </div>
-              )}
-            </div>
+            <ol className="how-to-steps">
+              {HOW_TO_STEPS.map((step, index) => (
+                <li key={index} className="how-to-step">
+                  <span className="step-number">{index + 1}</span>
+                  <p>{step}</p>
+                </li>
+              ))}
+            </ol>
           </div>
 
-          <div className="chat-section">
-            <h2>Preview the chat experience</h2>
-            <p>
-              We&apos;re still polishing the interface, but you can try the
-              advice powered demo below.
-            </p>
-            <div className="chat-frame">
-              <div className="chat-header">Assistant Demo</div>
-              <div className="chat-body">
-                <ChatWindow messages={messages} isTyping={isTyping} />
+          <div className="workspace">
+            <div className="workspace-panel chat-panel">
+              <header className="panel-header">
+                <div>
+                  <h2>Preview the chat experience</h2>
+                  <p>
+                    We&apos;re still polishing the interface, but you can try
+                    the advice powered demo below.
+                  </p>
+                </div>
+              </header>
+              <div className="chat-frame">
+                <div className="chat-header">Assistant Demo</div>
+                <div className="chat-body">
+                  <ChatWindow messages={messages} isTyping={isTyping} />
+                </div>
+                <div className="chat-footer">
+                  <ChatInput onSend={handleSend} />
+                </div>
               </div>
-              <div className="chat-footer">
-                <ChatInput onSend={handleSend} />
-              </div>
+            </div>
+
+            <div className="workspace-panel results-panel">
+              <CityRecommendations
+                isWaiting={isWaitingForCity && !cityResult}
+                result={cityResult}
+              />
             </div>
           </div>
         </section>
