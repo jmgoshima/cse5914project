@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from backend.langchain.schemas import Profile
+from backend.langchain.schemas import Profile, RecommendationResults
 from backend.langchain.conversation import (
     stepAgent,
     stepAgent_with_callback,
@@ -53,7 +53,7 @@ def _pretty(obj: Any) -> str:
         return str(obj)
 
 
-USE_LLM_REASONS: bool = False
+USE_LLM_REASONS: bool = True
 
 
 QUERY_SCRIPT_PATH = Path(__file__).resolve().parent.parent / "search" / "query.py"
@@ -79,7 +79,8 @@ def _profile_to_query_payload(profile: Profile) -> Dict[str, Any]:
 def _parse_query_output(raw_output: str) -> Dict[str, Any]:
     lines = [line.strip() for line in raw_output.splitlines() if line.strip()]
     header = None
-    cities: List[Dict[str, Any]] = []
+    reasoning: List[Dict[str, Any]] = []
+    rank = 1
     for line in lines:
         if header is None and line.lower().startswith("nearest neighbors"):
             header = line
@@ -92,16 +93,16 @@ def _parse_query_output(raw_output: str) -> Dict[str, Any]:
                 score = float(score_str)
             except ValueError:
                 score = score_str
-            cities.append({
-                "id": None,
-                "name": name,
+            reasoning.append({
+                "city": name,
                 "score": score,
                 "reason": None,
+                "rank": rank,
             })
+            rank += 1
     result: Dict[str, Any] = {
-        "count": len(cities),
-        "cities": cities,
         "raw_output": raw_output.strip(),
+        "reasoning": reasoning,
     }
     if header:
         result["header"] = header
@@ -114,8 +115,7 @@ def query_on_ready(profile: Profile) -> Dict[str, Any]:
 
     if not script_path.exists():
         return {
-            "count": 0,
-            "cities": [],
+            "reasoning": [],
             "error": f"Query script not found at {script_path}",
             "profile_payload": payload,
         }
@@ -125,8 +125,7 @@ def query_on_ready(profile: Profile) -> Dict[str, Any]:
         completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
         return {
-            "count": 0,
-            "cities": [],
+            "reasoning": [],
             "error": f"Query script failed with exit code {exc.returncode}",
             "stderr": (exc.stderr or "").strip(),
             "stdout": (exc.stdout or "").strip(),
@@ -134,28 +133,39 @@ def query_on_ready(profile: Profile) -> Dict[str, Any]:
             "command": cmd,
         }
 
-    result = _parse_query_output(completed.stdout)
+    raw_result = _parse_query_output(completed.stdout)
     if completed.stderr and completed.stderr.strip():
-        result["stderr"] = completed.stderr.strip()
-    result["profile_payload"] = payload
-    result["command"] = cmd
+        raw_result["stderr"] = completed.stderr.strip()
+    raw_result["profile_payload"] = payload
+    raw_result["command"] = cmd
 
-    if USE_LLM_REASONS and result.get("cities"):
-        for city in result["cities"]:
-            if not city.get("name"):
+    rec = RecommendationResults(**raw_result)
+
+    if USE_LLM_REASONS and rec.reasoning:
+        profile_json = profile.model_dump_json()
+        for entry in rec.reasoning:
+            if not (entry and entry.city):
                 continue
             try:
                 prompt = (
                     "You are a relocation advisor. In 2-4 sentences, explain why this city fits the user's preferences. "
                     "Reference cost of living, climate, safety, job market, and lifestyle if available. "
-                    "No markdown, no lists.\n\n"
-                    f"USER_PROFILE_JSON:\n{profile.model_dump_json()}\n\nCITY_NAME:\n{city['name']}\n\nREASON:"
+                    "Do not use markdown or bullet points.\n\n"
+                    f"USER_PROFILE_JSON:\n{profile_json}\n\n"
+                    f"CITY_NAME:\n{entry.city}\n"
                 )
-                city["reason"] = explain(prompt).strip()
+                if entry.score is not None:
+                    prompt += f"\nMATCH_CONFIDENCE:\n{entry.score}\n"
+                prompt += "\nREASON:"
+                reason_text = explain(prompt).strip()
             except Exception:
-                city["reason"] = city.get("reason") or "(reason unavailable)"
+                reason_text = entry.reason or "(reason unavailable)"
+            entry.reason = reason_text
 
-    return result
+    return rec.model_dump(
+        exclude={"reasoning": {"__all__": {"score", "id", "rank"}}},
+        exclude_none=True,
+    )
 
 def run_messages(messages: List[str], start_profile_path: str | None, keep_going: bool) -> int:
     profile = Profile()
@@ -277,9 +287,18 @@ def main(argv: List[str]) -> int:
         help="Do not exit when the profile becomes ready; continue processing messages.",
     )
     parser.add_argument(
-        "--llm-reasons", action="store_true",
-        help="Use the LLM to generate reasons for query results (requires API key).",
+        "--no-llm-reasons",
+        dest="llm_reasons",
+        action="store_false",
+        help="Skip LLM-generated explanations for nearest-neighbor results.",
     )
+    parser.add_argument(
+        "--llm-reasons",
+        dest="llm_reasons",
+        action="store_true",
+        help="Generate LLM explanations for nearest-neighbor results (default).",
+    )
+    parser.set_defaults(llm_reasons=True)
 
     args = parser.parse_args(argv)
 

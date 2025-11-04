@@ -14,16 +14,88 @@ const extractCityRecommendations = (payload) => {
     return [];
   }
 
-  if (Array.isArray(payload.cities)) {
-    return payload.cities;
+  const normalizeEntry = (entry, idx) => {
+    if (!entry || typeof entry !== "object") {
+      return null;
+    }
+    const cityName =
+      entry.city ||
+      entry.name ||
+      entry.title ||
+      entry.label ||
+      `City ${idx + 1}`;
+    const reasonText =
+      entry.reason ||
+      entry.summary ||
+      entry.description ||
+      entry.notes ||
+      entry.details ||
+      "";
+    const identifier =
+      entry.id ||
+      entry.city ||
+      entry.name ||
+      `${cityName}-${idx}`;
+    return {
+      id: identifier,
+      name: cityName,
+      reason: reasonText,
+      score: entry.score ?? entry.match ?? null,
+      raw: entry,
+    };
+  };
+
+  const extractReasoningArray = (obj) => {
+    if (obj && Array.isArray(obj.reasoning)) {
+      return obj.reasoning;
+    }
+    return null;
+  };
+
+  const reasoningSources = [
+    payload,
+    payload?.data,
+    payload?.data?.data,
+  ];
+
+  for (const source of reasoningSources) {
+    const entries = extractReasoningArray(source);
+    if (entries) {
+      return entries
+        .map((entry, idx) => normalizeEntry(entry, idx))
+        .filter(Boolean);
+    }
   }
 
-  if (Array.isArray(payload?.data?.cities)) {
-    return payload.data.cities;
-  }
+  const cityArrays = [
+    payload.cities,
+    payload?.data?.cities,
+    payload?.data?.data?.cities,
+  ].filter(Array.isArray);
 
-  if (Array.isArray(payload?.data?.data?.cities)) {
-    return payload.data.data.cities;
+  if (cityArrays.length > 0) {
+    const cities = cityArrays[0];
+    return cities
+      .map((entry, idx) => {
+        const normalized = normalizeEntry(entry, idx);
+        if (normalized && !normalized.reason) {
+          normalized.reason =
+            entry.reason ||
+            entry.summary ||
+            entry.description ||
+            entry.notes ||
+            entry.explanation ||
+            "";
+        }
+        if (normalized && !normalized.name) {
+          normalized.name =
+            entry.city ||
+            entry.name ||
+            `City ${idx + 1}`;
+        }
+        return normalized;
+      })
+      .filter(Boolean);
   }
 
   return [];
