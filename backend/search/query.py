@@ -35,7 +35,7 @@ else:
     )
 
 es = Elasticsearch("http://localhost:9200", **es_client_kwargs)
-index_name = "us_cities"
+index_name = "cities"
 
 DATA_FIELDS: Tuple[str, ...] = (
     "Climate",

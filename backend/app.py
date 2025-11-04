@@ -23,7 +23,7 @@ def create_app() -> Flask:
         TAKE_DEFAULT=int(os.getenv("TAKE_DEFAULT", "5")),
         CORS_ORIGINS=os.getenv("CORS_ORIGINS", "*"),
         CACHE_TTL_SECONDS=int(os.getenv("CACHE_TTL_SECONDS", "3600")),
-        CONVERSATION_TTL_SECONDS=int(os.getenv("CONVERSATION_TTL_SECONDS", "900")),
+        # CONVERSATION_TTL_SECONDS=int(os.getenv("CONVERSATION_TTL_SECONDS", "900")),
     )
 
     api = Blueprint("api", __name__, url_prefix="/api")
@@ -78,11 +78,11 @@ def create_app() -> Flask:
             state = _conversation_state.get(conversation_id)
             if not state:
                 return None
-            expires_at = state.get("expires_at")
-            if isinstance(expires_at, datetime) and expires_at <= datetime.utcnow():
-                _conversation_state.pop(conversation_id, None)
-                _close_stream(conversation_id)
-                return None
+            # expires_at = state.get("expires_at")
+            # if isinstance(expires_at, datetime) and expires_at <= datetime.utcnow():
+            #     _conversation_state.pop(conversation_id, None)
+            #     _close_stream(conversation_id)
+            #     return None
             state = dict(state)
         try:
             profile_json = state.get("profile")
@@ -111,23 +111,23 @@ def create_app() -> Flask:
         return profile, weights, hard_filters
 
     def _store_conversation_state(conversation_id: str, profile: Profile, weights: Optional[Weights], hard_filters: Optional[HardFilters]) -> None:
-        ttl_seconds = int(app.config.get("CONVERSATION_TTL_SECONDS", 900))
-        expires_at = datetime.utcnow() + timedelta(seconds=ttl_seconds)
+        # ttl_seconds = int(app.config.get("CONVERSATION_TTL_SECONDS", 900))
+        # expires_at = datetime.utcnow() + timedelta(seconds=ttl_seconds)
         state = {
             "profile": profile.model_dump_json(),
             "weights": weights.model_dump_json() if weights else None,
             "hard_filters": hard_filters.model_dump_json() if hard_filters else None,
-            "expires_at": expires_at,
+            # "expires_at": expires_at,
         }
         with _conversation_lock:
             _conversation_state[conversation_id] = state
 
     def _touch_conversation_state(conversation_id: str) -> None:
-        ttl_seconds = int(app.config.get("CONVERSATION_TTL_SECONDS", 900))
+        # ttl_seconds = int(app.config.get("CONVERSATION_TTL_SECONDS", 900))
         with _conversation_lock:
             state = _conversation_state.get(conversation_id)
-            if state:
-                state["expires_at"] = datetime.utcnow() + timedelta(seconds=ttl_seconds)
+            # if state:
+            #     state["expires_at"] = datetime.utcnow() + timedelta(seconds=ttl_seconds)
 
 
     # ---------- small helpers ----------
@@ -150,7 +150,7 @@ def create_app() -> Flask:
         if progress_cb:
             progress_cb("search_started", {"topK": top_k, "index": index})
         try:
-            resp = es().search(index=index, body=query, from_=0, size=top_k)
+            resp = es().search(index=index, body=query, from_=0)
         except Exception as e:
             raise RuntimeError(f"Elasticsearch query failed: {e}")
 
@@ -201,67 +201,67 @@ def create_app() -> Flask:
     @app.before_request
     def _before():
         g.request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-        g.started_at = datetime.utcnow()
+        # g.started_at = datetime.utcnow()
 
-    @app.get("/health")
-    def health():
-        try:
-            es_ok = bool(es().ping())
-        except Exception:
-            es_ok = False
-        return ok({"status": "up", "time": datetime.utcnow().isoformat() + "Z", "elasticsearch": "up" if es_ok else "down"})
+    # @app.get("/health")
+    # def health():
+    #     try:
+    #         es_ok = bool(es().ping())
+    #     except Exception:
+    #         es_ok = False
+    #     return ok({"status": "up", "time": datetime.utcnow().isoformat() + "Z", "elasticsearch": "up" if es_ok else "down"})
     
 
-    # 1) conversation: agent fills profile
-    @api.post("/userStep")
-    def user_step():
-        body = request.get_json(silent=True) or {}
-        msg = body.get("message")
-        if not msg:
-            return err("Missing 'message'.", 422)
-        conversation_id = body.get("conversationId") or body.get("conversation_id")
-        conversation_id = str(conversation_id) if conversation_id else None
+    # # 1) conversation: agent fills profile
+    # @api.post("/userStep")
+    # def user_step():
+    #     body = request.get_json(silent=True) or {}
+    #     msg = body.get("message")
+    #     if not msg:
+    #         return err("Missing 'message'.", 422)
+    #     conversation_id = body.get("conversationId") or body.get("conversation_id")
+    #     conversation_id = str(conversation_id) if conversation_id else None
 
-        profile: Profile
-        weights: Optional[Weights]
-        hard_filters: Optional[HardFilters]
+    #     profile: Profile
+    #     weights: Optional[Weights]
+    #     hard_filters: Optional[HardFilters]
 
-        if "profile" in body and isinstance(body["profile"], dict):
-            profile, weights, hard_filters = parse_envelope(body)
-        elif conversation_id:
-            loaded = _load_conversation_state(conversation_id)
-            if not loaded:
-                return err("Conversation expired or unknown. Send a full profile to start a new conversation.", 404)
-            profile, weights, hard_filters = loaded
-            _touch_conversation_state(conversation_id)
-        else:
-            profile, weights, hard_filters = Profile(), None, None
-            conversation_id = str(uuid.uuid4())
+    #     if "profile" in body and isinstance(body["profile"], dict):
+    #         profile, weights, hard_filters = parse_envelope(body)
+    #     elif conversation_id:
+    #         loaded = _load_conversation_state(conversation_id)
+    #         if not loaded:
+    #             return err("Conversation expired or unknown. Send a full profile to start a new conversation.", 404)
+    #         profile, weights, hard_filters = loaded
+    #         _touch_conversation_state(conversation_id)
+    #     else:
+    #         profile, weights, hard_filters = Profile(), None, None
+    #         conversation_id = str(uuid.uuid4())
 
-        if isinstance(body.get("weights"), dict):
-            try:
-                weights = Weights(**body["weights"])
-            except Exception as exc:
-                return err("Invalid 'weights' payload.", 422, {"reason": str(exc)})
+    #     if isinstance(body.get("weights"), dict):
+    #         try:
+    #             weights = Weights(**body["weights"])
+    #         except Exception as exc:
+    #             return err("Invalid 'weights' payload.", 422, {"reason": str(exc)})
 
-        if isinstance(body.get("hard_filters"), dict):
-            try:
-                hard_filters = HardFilters(**body["hard_filters"])
-            except Exception as exc:
-                return err("Invalid 'hard_filters' payload.", 422, {"reason": str(exc)})
+    #     if isinstance(body.get("hard_filters"), dict):
+    #         try:
+    #             hard_filters = HardFilters(**body["hard_filters"])
+    #         except Exception as exc:
+    #             return err("Invalid 'hard_filters' payload.", 422, {"reason": str(exc)})
 
-        updated = stepAgent(profile=profile, message=msg)
-        if conversation_id is None:
-            conversation_id = str(uuid.uuid4())
-        _store_conversation_state(conversation_id, updated, weights, hard_filters)
-        response_payload = {
-            "conversationId": conversation_id,
-            "profile": json.loads(updated.model_dump_json()),
-            "weights": json.loads(weights.model_dump_json()) if weights else None,
-            "hard_filters": json.loads(hard_filters.model_dump_json()) if hard_filters else None,
-        }
-        _publish_event(conversation_id, "status", {"stage": "profile_updated", "ready": bool(updated.notes.get("ready"))})
-        return ok(response_payload)
+    #     updated = stepAgent(profile=profile, message=msg)
+    #     if conversation_id is None:
+    #         conversation_id = str(uuid.uuid4())
+    #     _store_conversation_state(conversation_id, updated, weights, hard_filters)
+    #     response_payload = {
+    #         "conversationId": conversation_id,
+    #         "profile": json.loads(updated.model_dump_json()),
+    #         "weights": json.loads(weights.model_dump_json()) if weights else None,
+    #         "hard_filters": json.loads(hard_filters.model_dump_json()) if hard_filters else None,
+    #     }
+    #     _publish_event(conversation_id, "status", {"stage": "profile_updated", "ready": bool(updated.notes.get("ready"))})
+    #     return ok(response_payload)
 
     # initialize the api 
     @api.post("/initialize")
@@ -273,7 +273,7 @@ def create_app() -> Flask:
                 "weights": None,
                 "hard_filters": None,
                 "history": [],
-                "expires_at": datetime.utcnow() + timedelta(seconds=app.config["CONVERSATION_TTL_SECONDS"])
+                # "expires_at": datetime.utcnow() + timedelta(seconds=app.config["CONVERSATION_TTL_SECONDS"])
             }
         _publish_event(conversation_id, "status", {"stage": "initialized"})
         return ok({
@@ -296,6 +296,7 @@ def create_app() -> Flask:
             return err("Missing 'conversationId'.", 422)
 
         loaded = _load_conversation_state(conversation_id)
+        print(loaded)
         if not loaded:
             return err("Conversation not found or expired.", 404)
 
@@ -321,7 +322,7 @@ def create_app() -> Flask:
         with _conversation_lock:
             _conversation_state[conversation_id]["profile"] = updated_profile.model_dump_json()
             _conversation_state[conversation_id]["history"] = history
-            _conversation_state[conversation_id]["expires_at"] = datetime.utcnow() + timedelta(seconds=app.config["CONVERSATION_TTL_SECONDS"])
+            # _conversation_state[conversation_id]["expires_at"] = datetime.utcnow() + timedelta(seconds=app.config["CONVERSATION_TTL_SECONDS"])
 
         payload = {
             "conversationId": conversation_id,
@@ -419,72 +420,72 @@ def create_app() -> Flask:
 
     #     return ok(payload)
 
-    @api.get("/stream")
-    def stream_events():
-        conversation_id = request.args.get("session_id") or request.args.get("conversationId") or request.args.get("conversation_id")
-        if not conversation_id:
-            return err("Missing 'session_id'.", 422)
-        event_queue = _get_stream_queue(conversation_id)
+    # @api.get("/stream")
+    # def stream_events():
+    #     conversation_id = request.args.get("session_id") or request.args.get("conversationId") or request.args.get("conversation_id")
+    #     if not conversation_id:
+    #         return err("Missing 'session_id'.", 422)
+    #     event_queue = _get_stream_queue(conversation_id)
 
-        def _event_source():
-            yield _format_event("status", {"stage": "connected"})
-            while True:
-                try:
-                    item = event_queue.get(timeout=15)
-                except queue.Empty:
-                    yield "event: ping\ndata: {}\n\n"
-                    continue
-                if item is None:
-                    break
-                event_name = item.get("event") or "message"
-                data = item.get("data") or {}
-                yield _format_event(event_name, data)
+    #     def _event_source():
+    #         yield _format_event("status", {"stage": "connected"})
+    #         while True:
+    #             try:
+    #                 item = event_queue.get(timeout=15)
+    #             except queue.Empty:
+    #                 yield "event: ping\ndata: {}\n\n"
+    #                 continue
+    #             if item is None:
+    #                 break
+    #             event_name = item.get("event") or "message"
+    #             data = item.get("data") or {}
+    #             yield _format_event(event_name, data)
 
-        response = Response(stream_with_context(_event_source()), mimetype="text/event-stream")
-        response.headers["Cache-Control"] = "no-cache"
-        response.headers["X-Accel-Buffering"] = "no"
-        return response
+    #     response = Response(stream_with_context(_event_source()), mimetype="text/event-stream")
+    #     response.headers["Cache-Control"] = "no-cache"
+    #     response.headers["X-Accel-Buffering"] = "no"
+    #     return response
 
-    # 2) search: ES top-k cities from profile
-    @api.post("/search/places")
-    def search_places():
-        body = request.get_json(silent=True) or {}
-        if "profile" not in body:
-            return err("Missing 'profile'.", 422)
-        profile, _, _ = parse_envelope(body)
-        top_k = max(1, min(int(body.get("topK", app.config["MAX_RESULTS_DEFAULT"])), app.config["MAX_RESULTS_LIMIT"]))
-        index = body.get("index", app.config["ES_INDEX_DEFAULT"])
-        offset = int(body.get("from", 0))
-        query = buildQuery(profile=profile, topN=top_k)
-        try:
-            resp = es().search(index=index, body=query, from_=offset, size=top_k)
-        except Exception as e:
-            return err("Elasticsearch query failed.", 502, {"reason": str(e)})
-        hits = resp.get("hits", {}).get("hits", [])
-        total = resp.get("hits", {}).get("total", {}).get("value", len(hits))
-        results = [{"id": h.get("_id"), "score": h.get("_score"), "source": h.get("_source", {}), "highlight": h.get("highlight")} for h in hits]
-        return ok({"total": total, "count": len(results), "from": offset, "results": results, "raw_query": query})
+    # # 2) search: ES top-k cities from profile
+    # @api.post("/search/places")
+    # def search_places():
+    #     body = request.get_json(silent=True) or {}
+    #     if "profile" not in body:
+    #         return err("Missing 'profile'.", 422)
+    #     profile, _, _ = parse_envelope(body)
+    #     top_k = max(1, min(int(body.get("topK", app.config["MAX_RESULTS_DEFAULT"])), app.config["MAX_RESULTS_LIMIT"]))
+    #     index = body.get("index", app.config["ES_INDEX_DEFAULT"])
+    #     offset = int(body.get("from", 0))
+    #     query = buildQuery(profile=profile, topN=top_k)
+    #     try:
+    #         resp = es().search(index=index, body=query, from_=offset, size=top_k)
+    #     except Exception as e:
+    #         return err("Elasticsearch query failed.", 502, {"reason": str(e)})
+    #     hits = resp.get("hits", {}).get("hits", [])
+    #     total = resp.get("hits", {}).get("total", {}).get("value", len(hits))
+    #     results = [{"id": h.get("_id"), "score": h.get("_score"), "source": h.get("_source", {}), "highlight": h.get("highlight")} for h in hits]
+    #     return ok({"total": total, "count": len(results), "from": offset, "results": results, "raw_query": query})
 
-    # 3) recommend: ES → take top N → LLM adds reasons
-    @api.post("/recommend")
-    def recommend():
-        body = request.get_json(silent=True) or {}
-        if "profile" not in body:
-            return err("Missing 'profile'.", 422)
-        profile, _, _ = parse_envelope(body)
-        top_k = max(1, min(int(body.get("topK", app.config["MAX_RESULTS_DEFAULT"])), app.config["MAX_RESULTS_LIMIT"]))
-        take = max(1, min(int(body.get("take", app.config["TAKE_DEFAULT"])), top_k))
-        index = body.get("index", app.config["ES_INDEX_DEFAULT"])
+    # # 3) recommend: ES → take top N → LLM adds reasons
+    # @api.post("/recommend")
+    # def recommend():
+    #     body = request.get_json(silent=True) or {}
+    #     if "profile" not in body:
+    #         return err("Missing 'profile'.", 422)
+    #     profile, _, _ = parse_envelope(body)
+    #     top_k = max(1, min(int(body.get("topK", app.config["MAX_RESULTS_DEFAULT"])), app.config["MAX_RESULTS_LIMIT"]))
+    #     take = max(1, min(int(body.get("take", app.config["TAKE_DEFAULT"])), top_k))
+    #     index = body.get("index", app.config["ES_INDEX_DEFAULT"])
 
-        try:
-            rec = _recommend_for_profile(profile, top_k=top_k, take=take, index=index)
-        except RuntimeError as e:
-            return err("Elasticsearch query failed.", 502, {"reason": str(e)})
+    #     try:
+    #         rec = _recommend_for_profile(profile, top_k=top_k, take=take, index=index)
+    #     except RuntimeError as e:
+    #         return err("Elasticsearch query failed.", 502, {"reason": str(e)})
 
-        return ok({
-            "profile": json.loads(profile.model_dump_json()),
-            **rec
-        })
+    #     return ok({
+    #         "profile": json.loads(profile.model_dump_json()),
+    #         **rec
+    #     })
 
     app.register_blueprint(api)
 

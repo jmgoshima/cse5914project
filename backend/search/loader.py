@@ -60,7 +60,7 @@ min_max_df.to_csv(Path(__file__).parent / "data" / "places_min_max.csv", index=F
 
 
 # 2. Loading data into elastic search
-index_name = "us_cities"
+index_name = "cities"
 es = get_client()
 
 # Define mapping for the index
