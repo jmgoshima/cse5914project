@@ -1,15 +1,21 @@
 from __future__ import annotations
 import os, json, uuid, threading, queue
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, List
 from flask import Flask, jsonify, request, g, Blueprint, Response, stream_with_context
 from flask_cors import CORS
 
 # ---- your modules (heavy lifting lives here) ----
 from backend.langchain.conversation import stepAgent             # agent: fills Profile
 from backend.langchain.explain import explain                    # generic LLM call used for "reasons"
-from backend.langchain.schemas import Profile, Weights, HardFilters
-from backend.search.query import buildQuery                      # build ES query from Profile
+from backend.langchain.schemas import (
+    Profile,
+    Weights,
+    HardFilters,
+    RecommendationResults,
+    ReasoningEntry,
+)
+from backend.search.query import buildQuery, _profile_to_vector, DATA_FIELDS
 from backend.search.es_client import get_client                  # ES client factory
 from backend.utils.cache import get_cache                        # cache (redis or in-memory)
 # --------------------------------------------------
@@ -168,11 +174,21 @@ def create_app() -> Flask:
             )
             return explain(prompt).strip()
 
-        cities = []
+        try:
+            profile_vector = _profile_to_vector(profile)
+            profile_payload = {
+                field: float(value) for field, value in zip(DATA_FIELDS, profile_vector)
+            }
+        except Exception:
+            profile_payload = None
+
+        header = "Nearest neighbors to input vector:"
+        raw_lines: List[str] = []
+        reasoning_entries: List[ReasoningEntry] = []
         if progress_cb and hits:
             progress_cb("reasoning_started", {"count": len(hits)})
         profile_hash = hash(profile.model_dump_json())
-        for idx, h in enumerate(hits):
+        for idx, h in enumerate(hits, start=1):
             src = h.get("_source", {})
             cache_key = f"reason:{h.get('_id')}:{profile_hash}"
             reason = cache().get(cache_key) or make_reason(src)
@@ -180,23 +196,40 @@ def create_app() -> Flask:
                 cache().set(cache_key, reason, ex=app.config["CACHE_TTL_SECONDS"])
             except Exception:
                 pass
-            cities.append({
-                "id": h.get("_id"),
-                "name": src.get("name") or src.get("city") or "Unknown",
-                "score": h.get("_score"),
-                "source": src,
-                "reason": reason
-            })
+            city_name = src.get("name") or src.get("city") or "Unknown"
+            score_raw = h.get("_score")
+            score_value = float(score_raw) if isinstance(score_raw, (int, float)) else None
+            if isinstance(score_value, float):
+                raw_lines.append(f"  {idx}. {city_name} (score={score_value:.4f})")
+            else:
+                raw_lines.append(f"  {idx}. {city_name}")
+            reasoning_entries.append(
+                ReasoningEntry(
+                    city=city_name,
+                    reason=reason,
+                    score=score_value,
+                    id=str(h.get("_id")) if h.get("_id") is not None else None,
+                    rank=idx,
+                )
+            )
             if progress_cb:
-                progress_cb("reasoning_progress", {"current": idx + 1, "total": len(hits)})
+                progress_cb("reasoning_progress", {"current": idx, "total": len(hits)})
         if progress_cb:
-            progress_cb("reasoning_complete", {"count": len(cities)})
+            progress_cb("reasoning_complete", {"count": len(reasoning_entries)})
 
-        return {
-            "count": len(cities),
-            "cities": cities,
-            "raw_query": query
-        }
+        raw_output_lines = [header] + raw_lines if raw_lines else [header]
+        raw_output = "\n".join(raw_output_lines)
+        results = RecommendationResults(
+            header=header,
+            raw_output=raw_output,
+            profile_payload=profile_payload,
+            reasoning=reasoning_entries,
+        )
+
+        return results.model_dump(
+            exclude={"reasoning": {"__all__": {"score", "id", "rank"}}},
+            exclude_none=True,
+        )
 
     @app.before_request
     def _before():
