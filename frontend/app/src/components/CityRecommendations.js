@@ -93,7 +93,7 @@ const parseRawOutput = (rawOutput) => {
 const CityRecommendations = ({
   isWaiting,
   result,
-  enableDemoToggle = true,
+  enableDemoToggle = false,
 }) => {
   const [demoState, setDemoState] = useState("waiting");
   const usingDemo = enableDemoToggle;

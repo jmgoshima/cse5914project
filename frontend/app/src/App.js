@@ -102,21 +102,21 @@ const extractCityRecommendations = (payload) => {
   return [];
 };
 
-const isRecommendationReady = (payload) => {
-  if (!payload || typeof payload !== "object") {
-    return false;
-  }
+// const isRecommendationReady = (payload) => {
+//   if (!payload || typeof payload !== "object") {
+//     return false;
+//   }
 
-  if (typeof payload.ready === "boolean") {
-    return payload.ready;
-  }
+//   if (typeof payload.ready === "boolean") {
+//     return payload.ready;
+//   }
 
-  if (typeof payload?.data?.ready === "boolean") {
-    return payload.data.ready;
-  }
+//   if (typeof payload?.data?.ready === "boolean") {
+//     return payload.data.ready;
+//   }
 
-  return false;
-};
+//   return false;
+// };
 
 function App() {
   const [messages, setMessages] = useState([
@@ -184,21 +184,34 @@ function App() {
       // backend returns response in data.response
       const botReply = data?.data?.profile.notes.next_question || "Hmm, I didn’t understand that.";
 
-      const recommendationPayload =
-        data?.city_recommendations || data?.data?.city_recommendations || data;
+      // const recommendationPayload =
+      //   data?.recommendations || data?.data?.recommendations || data;
 
-      if (
-        recommendationPayload?.raw_output ||
-        recommendationPayload?.cities ||
-        recommendationPayload?.profile_payload
-      ) {
+      // if (
+      //   recommendationPayload?.raw_output ||
+      //   recommendationPayload?.cities ||
+      //   recommendationPayload?.profile_payload
+      // ) {
+      //   setCityResult({
+      //     header: recommendationPayload.header,
+      //     raw_output: recommendationPayload.raw_output,
+      //     cities: recommendationPayload.cities,
+      //     profile_payload: recommendationPayload.profile_payload,
+      //   });
+      // } else {
+      //   setCityResult(null);
+      // }
+
+      if (data?.data?.ready) {
+        const recommendationPayload = data?.data?.recommendations;
         setCityResult({
           header: recommendationPayload.header,
           raw_output: recommendationPayload.raw_output,
-          cities: recommendationPayload.cities,
+          reasoning: recommendationPayload.reasoning,
           profile_payload: recommendationPayload.profile_payload,
         });
-      } else {
+      }
+      else {
         setCityResult(null);
       }
 
