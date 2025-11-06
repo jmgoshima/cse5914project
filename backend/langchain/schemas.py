@@ -15,7 +15,7 @@ class Weights(BaseModel):
 class HardFilters(BaseModel):
     country: Optional[str] = None
     state: Optional[str] = None
-    min_population: Optional[int] = None
+    min_population: Optional[float] = None
     visa_required: Optional[bool] = None
 
 
@@ -45,7 +45,7 @@ class Profile(BaseModel):
 
     # Location and population
     location: Optional[Dict[str, float]] = None  # {'lat': float, 'lon': float}
-    population_min: Optional[int] = None
+    population_min: Optional[float] = None
 
     # Legacy / conversational fields (kept for backward compatibility)
     budget_monthly_usd: Optional[int] = None
