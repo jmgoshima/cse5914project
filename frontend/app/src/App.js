@@ -182,7 +182,22 @@ function App() {
 
       const data = await response.json();
       // backend returns response in data.response
-      const botReply = data?.data?.profile.notes.next_question || "Hmm, I didn’t understand that.";
+      let botReply = null;
+      if (data?.data?.ready) {
+        const recommendationPayload = data?.data?.recommendations;
+        setCityResult({
+          header: recommendationPayload.header,
+          raw_output: recommendationPayload.raw_output,
+          reasoning: recommendationPayload.reasoning,
+          profile_payload: recommendationPayload.profile_payload,
+        });
+        botReply = "Evaluation complete!"
+      }
+      else {
+        setCityResult(null);
+        botReply = data?.data?.profile.notes.next_question || "Hmm, I didn’t understand that.";
+      }
+  
 
       // const recommendationPayload =
       //   data?.recommendations || data?.data?.recommendations || data;
@@ -201,19 +216,6 @@ function App() {
       // } else {
       //   setCityResult(null);
       // }
-
-      if (data?.data?.ready) {
-        const recommendationPayload = data?.data?.recommendations;
-        setCityResult({
-          header: recommendationPayload.header,
-          raw_output: recommendationPayload.raw_output,
-          reasoning: recommendationPayload.reasoning,
-          profile_payload: recommendationPayload.profile_payload,
-        });
-      }
-      else {
-        setCityResult(null);
-      }
 
       setMessages((prev) => [...prev, { sender: "bot", text: botReply }]);
     } catch (err) {
