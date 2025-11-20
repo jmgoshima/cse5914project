@@ -20,6 +20,12 @@ load_dotenv(dotenv_path=env_path_relative)
 
 # 1. Clean and Normalize Data
 
+# Load the original data set, adjust the housing coust to be monthly housing cost, then save as places.csv
+df = pd.read_csv(Path(__file__).parent / "data" / "places_og.csv")
+df['HousingCost'] = df['HousingCost'] / 12
+
+df.to_csv(Path(__file__).parent / "data" / "places.csv", index=False)
+
 # Load data as a dataframe
 df = pd.read_csv(Path(__file__).parent / "data" / "places.csv")
 
