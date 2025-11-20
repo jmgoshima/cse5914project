@@ -557,9 +557,13 @@ body {
 }
 
 .chat-body {
-  flex: 1;
+  flex: none;
   padding: 24px 20px;
   display: flex;
+  height: min(420px, 45vh);
+  max-height: 420px;
+  min-height: 280px;
+  overflow: hidden;
 }
 
 .chat-body .chat-window {
@@ -605,6 +609,14 @@ body {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
+  height: 100%;
+}
+
+@media (max-width: 768px) {
+  .chat-body {
+    height: min(340px, 50vh);
+    min-height: 220px;
+  }
 }
 
 /* Message Rows */
