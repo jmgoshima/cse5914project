@@ -120,7 +120,7 @@ const extractCityRecommendations = (payload) => {
 
 function App() {
   const [messages, setMessages] = useState([
-    { sender: "bot", text: "Hello! How can I help you today?" },
+    { sender: "bot", text: "Hello! I'm Compass, your relocation assistant. What climate do you prefer?" },
   ]);
   const [isTyping, setIsTyping] = useState(false);
   const [conversationID, setConversationID] = useState(null);
@@ -181,21 +181,29 @@ function App() {
       });
 
       const data = await response.json();
-      // backend returns response in data.response
-      let botReply = null;
-      if (data?.data?.ready) {
-        const recommendationPayload = data?.data?.recommendations;
+      const payload = data?.data;
+      const notes = payload?.profile?.notes || {};
+
+      // Prefer the assistant's reply; fall back to next_question only if missing.
+      let botReply =
+        payload?.response ||
+        notes.response ||
+        "Let me know your answer to the last question.";
+
+      if (payload?.ready) {
+        const recommendationPayload = payload?.recommendations;
         setCityResult({
           header: recommendationPayload.header,
           raw_output: recommendationPayload.raw_output,
           reasoning: recommendationPayload.reasoning,
           profile_payload: recommendationPayload.profile_payload,
         });
-        botReply = "Evaluation complete!"
-      }
-      else {
+        botReply =
+          payload?.response ||
+          notes.response ||
+          "Evaluation complete!";
+      } else {
         setCityResult(null);
-        botReply = data?.data?.profile.notes.next_question || "Hmm, I didn’t understand that.";
       }
   
 
