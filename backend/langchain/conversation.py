@@ -18,25 +18,41 @@ from __future__ import annotations
 import os
 import re
 import json
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, Tuple
 
+from pydantic import BaseModel, Field
+
 # Load .env variables if present for local dev (e.g., GOOGLE_API_KEY)
-try:  # pragma: no cover
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:  # pragma: no cover
-    pass
+# try:  # pragma: no cover
+#     from dotenv import load_dotenv
+#     load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
+# except Exception:  # pragma: no cover
+#     pass
+
+
+
+# Temporary hardcoded Gemini creds to guarantee the agent initializes locally.
+HARDCODED_GOOGLE_API_KEY = "AIzaSyBxNcTpTuCM7OyG_uuRGOXeuBZhTbwFn38"
+# Old default model kept here for reference:
+# HARDCODED_GEMINI_MODEL = "gemini-2.5-flash"
+HARDCODED_GEMINI_MODEL = "gemini-1.5-flash"
+os.environ.setdefault("GOOGLE_API_KEY", HARDCODED_GOOGLE_API_KEY)
+os.environ.setdefault("GEMINI_MODEL", HARDCODED_GEMINI_MODEL)
 
 from .schemas import Profile
-from backend.search.qualitative import get_qualitative_options, qualitative_to_numeric
+from backend.search.qualitative import qualitative_to_numeric
 
 # --- Optional LangChain imports (graceful fallback if missing) ------------
 _LC_AVAILABLE = True
 try:
+    import google.generativeai as genai
     from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_core.messages import BaseMessage, HumanMessage
     from langchain_core.prompts import ChatPromptTemplate
-    from langchain_core.output_parsers import PydanticOutputParser
-except Exception:  # pragma: no cover
+    from langchain_core.exceptions import OutputParserException
+except Exception as exc:  # pragma: no cover
+    print("LangChain Gemini imports failed:", type(exc).__name__, exc)
     _LC_AVAILABLE = False
 
 
@@ -122,6 +138,125 @@ _NEGATIVE_WORDS = {
     "that is all",
     "that's all",
 }
+
+_CONVERSATIONAL_FIELD_PROMPTS = {
+    "climate": "What kind of climate feels best to you—are you chasing sunshine, four distinct seasons, or something in between?",
+    "transit": "Describe your ideal transportation setup. Should it feel super walkable, have great transit, or is driving totally fine?",
+    "safety": "Tell me about the level of safety that would make you feel at ease day to day.",
+    "healthcare": "How close or high-quality do you need healthcare options to be?",
+    "education": "Are nearby schools, universities, or learning hubs important for you or your household?",
+    "arts": "Paint me a picture of the arts and culture vibe you’d love—live music, galleries, theaters, or something else entirely?",
+    "recreation": "What kind of outdoor or recreation energy fits you best—endless trails, beaches, parks, or low-key green spaces?",
+    "economy": "When you think about the local economy, are you drawn to booming job markets, steady stability, or a relaxed pace?",
+    "population": "Awesome! For city size, do you imagine a massive metropolis, something mid-sized, or a more intimate community?",
+}
+
+FIELD_GUIDELINES = "\n".join([
+    "• climate – understand the temperatures or seasons the user enjoys.",
+    "• transit – learn if they need walkability, transit, or are fine driving.",
+    "• safety – capture how safe they want to feel in daily life.",
+    "• healthcare – ask about proximity/quality of care they expect.",
+    "• education – note whether schools or learning hubs matter to them.",
+    "• arts – uncover the culture/arts scene that energizes them.",
+    "• recreation – find out their preferred outdoor or leisure vibe.",
+    "• economy – learn whether they prefer booming job markets or calmer stability.",
+    "• population – gauge whether they want a huge metropolis, something mid-sized, or intimate.",
+])
+
+STRUCTURE_INSTRUCTIONS = (
+    "Respond with exactly one compact, single-line JSON object (no markdown, no prose before/after, no newlines) containing:\n"
+    '{ "assistant_reply": string,\n'
+    '  "ready": boolean,\n'
+    '  "next_question": string or null,\n'
+    '  "pending_fields": array_of_strings,\n'
+    '  "profile": ProfileObject }\n'
+    "assistant_reply and next_question must be short (1-2 sentences, each <= 100 characters), plain strings (no quotes that break JSON). "
+    "Always include all keys above, even if values are null/empty. Total JSON < 400 characters; never truncate with ellipses; no extra keys. "
+    "ProfileObject: use only these fields and types: preferred_climates (array: hot, warm, temperate, mild, cool, cold, tropical), "
+    "budget_monthly_usd (number), housing_cost_target_max/min (number), healthcare_min_score/safety_min_score/transit_min_score/education_min_score/economy_score_min (numbers 0-10), "
+    "population_min (number), hard_filters.country/state (string), hard_filters.min_population (number), notes (object), weights (object). "
+    "Do NOT introduce other profile keys. Numeric fields must be numbers (not strings); scores must be 0-10. "
+    "pending_fields must be a subset of: climate, transit, safety, healthcare, education, arts, recreation, economy, population. "
+    "When ready=true, pending_fields must be empty and next_question null."
+)
+
+
+def _repair_json_text(text: str) -> str:
+    """Best-effort trim/close JSON to avoid trivial truncation issues."""
+    if not text or "{" not in text:
+        return text
+    candidate = text.strip()
+    # Drop trailing ellipses or stray commas
+    candidate = candidate.rstrip(".… ,")
+    # Balance braces/brackets if obviously short
+    open_braces = candidate.count("{")
+    close_braces = candidate.count("}")
+    if close_braces < open_braces:
+        candidate += "}" * (open_braces - close_braces)
+    open_brackets = candidate.count("[")
+    close_brackets = candidate.count("]")
+    if close_brackets < open_brackets:
+        candidate += "]" * (open_brackets - close_brackets)
+    return candidate
+
+
+def _extract_assistant_reply(text: str) -> Optional[str]:
+    """Pull assistant_reply from a malformed JSON string if possible."""
+    if not text:
+        return None
+    try:
+        import re
+        match = re.search(r'"assistant_reply"\s*:\s*"([^"]*)"', text)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def _coerce_partial_payload(text: str) -> Optional[Dict[str, Any]]:
+    """Best-effort extraction when JSON is truncated/invalid."""
+    if not text:
+        return None
+    payload: Dict[str, Any] = {}
+    try:
+        import re
+        reply = _extract_assistant_reply(text)
+        if reply:
+            payload["assistant_reply"] = reply
+
+        m_ready = re.search(r'"ready"\s*:\s*(true|false)', text, re.IGNORECASE)
+        if m_ready:
+            payload["ready"] = m_ready.group(1).lower() == "true"
+
+        m_next = re.search(r'"next_question"\s*:\s*"([^"]*)', text)
+        if m_next:
+            payload["next_question"] = m_next.group(1)
+
+        m_pending = re.search(r'"pending_fields"\s*:\s*\[(.*?)\]', text, re.DOTALL)
+        if m_pending:
+            raw_list = m_pending.group(1)
+            items = []
+            for part in raw_list.split(","):
+                val = part.strip().strip('"').strip()
+                if val:
+                    items.append(val)
+            payload["pending_fields"] = items
+
+        if '"profile"' in text:
+            payload["profile"] = {}
+    except Exception:
+        return None
+
+    if payload:
+        # ensure required keys exist
+        payload.setdefault("assistant_reply", "")
+        payload.setdefault("ready", False)
+        payload.setdefault("next_question", None)
+        payload.setdefault("pending_fields", [])
+        payload.setdefault("profile", {})
+        return payload
+    return None
 
 _QUAL_FIELD_INFO = {
     "climate": {
@@ -225,6 +360,8 @@ _QUAL_FIELD_INFO = {
         },
         "synonyms": {
             "good hospitals": "good",
+            "hospital": "good",
+            "nearby hospital": "good",
             "top hospitals": "excellent",
             "average hospitals": "average",
             "limited healthcare": "limited",
@@ -237,6 +374,7 @@ _QUAL_FIELD_INFO = {
         "note_key": "education",
         "score_attr": "education_min_score",
         "descriptions": {
+            "not important": "Education is not a priority for this move.",
             "average": "Schools on par with national averages.",
             "excellent": "Top-performing schools with strong outcomes.",
             "good": "Above-average schools with solid reputations.",
@@ -244,6 +382,10 @@ _QUAL_FIELD_INFO = {
             "top": "Elite programs and consistently exceptional results.",
         },
         "synonyms": {
+            "not important": "not important",
+            "not a priority": "not important",
+            "no school": "not important",
+            "none needed": "not important",
             "good schools": "good",
             "great schools": "excellent",
             "top schools": "top",
@@ -338,8 +480,8 @@ _QUAL_FIELD_INFO = {
 }
 
 for _field_key, _info in _QUAL_FIELD_INFO.items():
-    _info["options"] = list(get_qualitative_options(_info["dataset_field"]))
-    _info["options_lower"] = [opt.lower() for opt in _info["options"]]
+    _info["options"] = []
+    _info["options_lower"] = []
     _info["synonyms"] = {str(k).lower(): v for k, v in _info.get("synonyms", {}).items()}
 
 _FIELD_KEYWORD_ENTRIES: List[tuple[str, str]] = []
@@ -363,34 +505,13 @@ for _field_key, _info in _QUAL_FIELD_INFO.items():
             if alias_key:
                 _FIELD_NAME_LOOKUP[alias_key] = _field_key
 
-_CLIMATE_OPTIONS = list(_QUAL_FIELD_INFO["climate"]["options"])
-
-
-def _build_qualitative_guidance_text() -> str:
-    lines: List[str] = []
-    for field_key in QUAL_FIELD_ORDER:
-        info = _QUAL_FIELD_INFO.get(field_key)
-        if not info:
-            continue
-        options = info.get("options") or []
-        if options:
-            lines.append(f"- {info['label']}: {', '.join(options)}")
-    return "\n".join(lines)
-
-
-QUALITATIVE_GUIDANCE_TEXT = _build_qualitative_guidance_text()
+_CLIMATE_OPTIONS: List[str] = []
 
 
 def _set_qualitative_options_note(profile: Profile) -> None:
-    """Expose acceptable qualitative descriptors to calling layers via notes."""
-    if not isinstance(profile.notes, dict):
-        return
-    options_note = profile.notes.setdefault("qualitative_options", {})
-    for field_key in QUAL_FIELD_ORDER:
-        info = _QUAL_FIELD_INFO.get(field_key)
-        if not info:
-            continue
-        options_note[field_key] = list(info.get("options", []))
+    """Legacy hook removed: no qualitative options shared in notes."""
+    if isinstance(profile.notes, dict):
+        profile.notes.pop("qualitative_options", None)
 
 
 _EXPLANATION_TRIGGERS = (
@@ -408,6 +529,173 @@ _EXPLANATION_TRIGGERS = (
 def _user_requested_explanation(message: str) -> bool:
     text = (message or "").lower()
     return any(trigger in text for trigger in _EXPLANATION_TRIGGERS)
+
+
+class AgentTurnOutput(BaseModel):
+    """Structured response returned by the Gemini agent each turn."""
+
+    profile: Profile
+    assistant_reply: str = Field(
+        ..., description="Natural language response to show the user."
+    )
+    ready: bool = False
+    next_question: Optional[str] = Field(
+        default=None,
+        description="Follow-up question to keep refining the profile when not ready.",
+    )
+    pending_fields: List[str] = Field(
+        default_factory=list,
+        description="Short list of profile concepts that still require clarification.",
+    )
+
+
+# Keep prompts lean to avoid token overruns.
+# Keep prompts lean to avoid token overruns, but retain enough context (last 6 messages).
+_CHAT_HISTORY_LIMIT = 1
+
+
+def _format_history_for_prompt(history: Any) -> str:
+    """Return only the most recent assistant + user messages to keep prompts lean."""
+    if not isinstance(history, list) or not history:
+        return "No prior conversation."
+    recent = history[-_CHAT_HISTORY_LIMIT:]
+    lines: List[str] = []
+    for entry in recent:
+        if isinstance(entry, dict):
+            role = entry.get("role") or "assistant"
+            content = entry.get("content") or ""
+        else:
+            role = "user"
+            content = str(entry)
+        content = content.strip()
+        if not content:
+            continue
+        lines.append(f"{role.upper()}: {content}")
+    return "\n".join(lines) if lines else "No prior conversation."
+
+
+def _append_history_entry(history: List[Dict[str, str]], role: str, content: str) -> None:
+    text = (content or "").strip()
+    if not text:
+        return
+    history.append({"role": role, "content": text})
+    if len(history) > _CHAT_HISTORY_LIMIT:
+        del history[: len(history) - _CHAT_HISTORY_LIMIT]
+
+
+def _coerce_message_text(output: Any) -> str:
+    if isinstance(output, BaseMessage):
+        return _coerce_message_text(output.content)
+    if isinstance(output, list):
+        parts = [_coerce_message_text(item) for item in output]
+        return "\n".join(part for part in parts if part)
+    if output is None:
+        return ""
+    return str(output)
+
+
+def _build_retry_feedback(error: Exception, raw_text: str) -> str:
+    """Generate additional system guidance when a retry is needed."""
+    reason = str(error).strip() or type(error).__name__
+    snippet = (raw_text or "").strip()
+    if snippet:
+        if len(snippet) > 600:
+            snippet = f"{snippet[:600]}…"
+    else:
+        snippet = "No JSON output was produced."
+    return (
+        "Reminder: respond with a single JSON object that matches the schema. "
+        f"The previous attempt failed because: {reason}. "
+        f"Previous output snippet: {snippet}"
+    )
+
+
+def _build_fallback_turn_output(profile: Profile, notes: Dict[str, Any]) -> AgentTurnOutput:
+    """Create a safe fallback response when Gemini keeps failing."""
+    turns = notes.get("turns") if isinstance(notes.get("turns"), list) else []
+    if turns:
+        message = (
+            "I hit a snag reaching my language model, but I saved what you just shared. "
+            "Let's keep going while I reconnect."
+        )
+    else:
+        message = (
+            "Hello there! I'm Compass, your friendly guide to finding a new home in the United States. "
+            "Tell me your name and what you're dreaming about for this move so I can get started."
+        )
+    pending = notes.get("pending_fields") if isinstance(notes.get("pending_fields"), list) else []
+    next_question = (
+        notes.get("next_question")
+        or notes.get("_last_question")
+        or notes.get("_fallback_question")
+        or _default_next_question(profile)
+        or "Could you tell me a bit more about your ideal city?"
+    )
+    fallback_profile = Profile()
+    return AgentTurnOutput(
+        profile=fallback_profile,
+        assistant_reply=message,
+        ready=False,
+        next_question=next_question,
+        pending_fields=pending,
+    )
+
+
+def _sanitize_structured_response(raw: Dict[str, Any]) -> Dict[str, Any]:
+    data = raw if isinstance(raw, dict) else {}
+    profile = data.get("profile")
+    if isinstance(profile, str):
+        try:
+            profile = json.loads(profile) if profile.strip() else {}
+        except Exception:
+            profile = {}
+    if not isinstance(profile, dict):
+        profile = {}
+    notes = profile.get("notes")
+    if isinstance(notes, str):
+        try:
+            profile["notes"] = json.loads(notes) if notes.strip() else {}
+        except Exception:
+            profile["notes"] = {}
+    elif not isinstance(notes, dict):
+        profile["notes"] = {}
+    for key in ("hard_filters", "weights"):
+        value = profile.get(key)
+        if isinstance(value, str):
+            profile[key] = None
+    data["profile"] = profile
+
+    pending = data.get("pending_fields")
+    if isinstance(pending, str):
+        data["pending_fields"] = [pending] if pending.strip() else []
+    elif not isinstance(pending, list):
+        data["pending_fields"] = []
+
+    reply = data.get("assistant_reply")
+    data["assistant_reply"] = reply or ""
+    data["ready"] = bool(data.get("ready"))
+    return data
+
+
+def _profile_json_for_prompt(profile: Profile) -> str:
+    """Trim bulky fields before sending profile context to the LLM."""
+    data = profile.model_dump()
+    notes = data.get("notes")
+    if isinstance(notes, dict):
+        for key in (
+            "qualitative_options",
+            "chat_history",
+            "turns",
+            "response",
+            "next_action",
+        ):
+            notes.pop(key, None)
+        for key in list(notes.keys()):
+            if key.startswith("qualitative_options"):
+                notes.pop(key, None)
+    return json.dumps(data, ensure_ascii=False)
+
+
 
 
 def _infer_fields_from_text(text: Optional[str]) -> List[str]:
@@ -655,6 +943,8 @@ def _apply_field_value(profile: Profile, field_key: str, option: str) -> None:
         profile.notes[note_key] = option
 
     if field_key == "climate":
+        if profile.preferred_climates is None:
+            profile.preferred_climates = []
         existing = [str(x).lower() for x in profile.preferred_climates if isinstance(x, str)]
         option_lower = option.lower()
         if option_lower not in existing:
@@ -760,20 +1050,20 @@ def _question_for_field(field_key: str) -> Optional[str]:
     info = _QUAL_FIELD_INFO.get(field_key)
     if not info:
         return None
-    options = info.get("options") or []
-    if not options:
-        return None
-    options_list = ", ".join(options)
-    if field_key == "climate":
-        return (
-            f"Which climate option best matches what you want in a new city? "
-            f"Choose from: {options_list}."
-        )
+    conversational = _CONVERSATIONAL_FIELD_PROMPTS.get(field_key)
+    if conversational:
+        return conversational
     label = info.get("label", field_key)
-    return (
-        f"Which {label} option best matches what you want in a new city? "
-        f"Choose from: {options_list}."
-    )
+    return f"Tell me about your preferences for {label} in your next city."
+
+
+def _sanitize_question_text(question: str, profile: Profile) -> Optional[str]:
+    text = (question or "").strip()
+    if not text:
+        return None
+    if text and text[-1] not in ".?!":
+        text = text + "?"
+    return text
 
 
 def _cleanup_pending_fields(profile: Profile) -> None:
@@ -831,33 +1121,19 @@ def _advance_questionnaire(profile: Profile) -> None:
     if profile.notes.get("pending_fields"):
         return
     question, fields = _determine_next_question(profile)
-    if question:
-        profile.notes["next_question"] = question
+    if fields:
         profile.notes["pending_fields"] = fields
-        profile.notes["_last_question"] = question
     else:
-        profile.notes.pop("next_question", None)
         profile.notes.pop("pending_fields", None)
 
 
 def _ensure_initial_question(profile: Profile) -> None:
     if not isinstance(profile.notes, dict):
         profile.notes = {}
-    if profile.notes.get("next_question"):
-        return
     question, fields = _determine_next_question(profile)
-    if question:
-        profile.notes["next_question"] = question
+    if fields:
         profile.notes["pending_fields"] = fields
-        profile.notes["_last_question"] = question
-        profile.notes["ready"] = False
-        return
-    fallback = _default_next_question(profile)
-    if fallback:
-        profile.notes["next_question"] = fallback
-        profile.notes["_last_question"] = fallback
-        profile.notes.pop("pending_fields", None)
-        profile.notes["ready"] = False
+    profile.notes["ready"] = False
 
 
 def _ensure_qualitative_alignment(profile: Profile) -> List[str]:
@@ -988,12 +1264,17 @@ def _heuristic_update(profile: Profile, message: str) -> Profile:
     if not clarification_handled:
         if notes.get("pending_fields"):
             pass
-        elif profile.budget_monthly_usd is None and not notes.get("next_question"):
-            notes.pop("pending_fields", None)
-            notes["next_question"] = "What is your approximate monthly housing budget (in USD)?"
-            notes["_last_question"] = notes["next_question"]
         else:
             _advance_questionnaire(profile)
+
+    # Compute missing fields deterministically to avoid repeats.
+    missing_fields = _missing_fields(profile)
+    # Always overwrite pending_fields based on current profile state
+    if missing_fields:
+        pending = [f for f in missing_fields if f != "budget"]
+        notes["pending_fields"] = pending
+    else:
+        notes.pop("pending_fields", None)
 
     guidance = [] if clarification_handled else _ensure_qualitative_alignment(profile)
     if guidance:
@@ -1011,175 +1292,337 @@ def _heuristic_update(profile: Profile, message: str) -> Profile:
         if ready:
             notes.pop("next_question", None)
             notes.pop("pending_fields", None)
-        elif not notes.get("next_question"):
-            _advance_questionnaire(profile)
-            if not notes.get("next_question"):
-                nq = _default_next_question(profile)
-                if nq:
-                    notes.pop("pending_fields", None)
-                    notes["next_question"] = nq
-                    notes["_last_question"] = nq
+        else:
+            # Always drive the next question from the first missing field (budget first if missing)
+            field_for_question = None
+            if "budget" in missing_fields:
+                field_for_question = "budget"
+            elif notes.get("pending_fields"):
+                field_for_question = notes["pending_fields"][0]
+            if field_for_question:
+                qtext = _question_for_key(field_for_question)
+                if qtext:
+                    notes["next_question"] = qtext
+                    notes["_last_question"] = qtext
+                    notes["response"] = qtext
+            else:
+                notes.pop("next_question", None)
 
     _set_qualitative_options_note(profile)
     return profile
+
+
+# -------------------- LLM parsing helpers --------------------
+
+def _parse_llm_profile_block(raw_text: str) -> tuple[str, Dict[str, str]]:
+    """Split assistant reply and fenced profile block."""
+    import re
+    if not raw_text:
+        return "", {}
+    match = re.search(r"```profile(.*?)```", raw_text, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return raw_text.strip(), {}
+    block = match.group(1)
+    # Remove the fenced block from assistant reply
+    assistant_reply = (raw_text[: match.start()] + raw_text[match.end() :]).strip()
+    parsed: Dict[str, str] = {}
+    for line in block.splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        k = key.strip().lower()
+        v = val.strip()
+        parsed[k] = v
+    return assistant_reply, parsed
+
+
+def _apply_parsed_profile(profile: Profile, data: Dict[str, str]) -> None:
+    """Apply parsed LLM block into the Profile object."""
+    if not isinstance(data, dict):
+        return
+    if not isinstance(profile.notes, dict):
+        profile.notes = {}
+    notes = profile.notes
+
+    def to_float(value: str) -> Optional[float]:
+        if not value:
+            return None
+        try:
+            return float(value.replace(",", ""))
+        except Exception:
+            return None
+
+    # Key normalization
+    key_map = {
+        "climate": "climate",
+        "transit": "transit",
+        "safety": "safety",
+        "healthcare": "healthcare",
+        "education": "education",
+        "arts": "arts",
+        "recreation": "recreation",
+        "economy": "economy",
+        "population": "population",
+        "pop": "population",
+        "budget": "budget",
+        "next_question": "next_question",
+    }
+
+    for raw_key, raw_val in data.items():
+        key = key_map.get(raw_key.lower().strip())
+        if not key:
+            continue
+        val = raw_val.strip()
+        if not val:
+            continue
+        if key == "climate":
+            if profile.preferred_climates is None:
+                profile.preferred_climates = []
+            if val.lower() not in [str(x).lower() for x in profile.preferred_climates]:
+                profile.preferred_climates.append(val)
+        elif key == "transit":
+            num = to_float(val)
+            if num is not None:
+                profile.transit_min_score = num
+        elif key == "safety":
+            num = to_float(val)
+            if num is not None:
+                profile.safety_min_score = num
+        elif key == "healthcare":
+            num = to_float(val)
+            if num is not None:
+                profile.healthcare_min_score = num
+        elif key == "education":
+            num = to_float(val)
+            if num is not None:
+                profile.education_min_score = num
+        elif key == "economy":
+            num = to_float(val)
+            if num is not None:
+                profile.economy_score_min = num
+        elif key == "population":
+            num = to_float(val)
+            if num is not None and num > 0:
+                profile.population_min = num
+                notes["population"] = val
+        elif key == "budget":
+            num = to_float(val)
+            if num is not None and num > 0:
+                profile.budget_monthly_usd = int(num)
+                profile.housing_cost_target_max = float(num)
+                notes["budget"] = val
+        elif key == "arts":
+            notes["arts"] = val
+        elif key == "recreation":
+            notes["recreation"] = val
+        elif key == "next_question":
+            notes["next_question"] = val
+            notes["_last_question"] = val
+
 
 
 # -------------------- LLM-powered updater ---------------------------------
 
 # Build LLM objects at import time (once per process). If unavailable, we keep None.
 _LLM = None
-_PARSER = None
-_PROMPT = None
-
 if _LC_AVAILABLE:
     try:  # lazy, tolerate missing keys
+        api_key = os.getenv("GOOGLE_API_KEY")
+        print("LLM init: API key present?", bool(api_key))
+        if not api_key:
+            raise RuntimeError("GOOGLE_API_KEY is not set; cannot configure Gemini.")
+        genai.configure(api_key=api_key)
         _LLM = ChatGoogleGenerativeAI(
-            model=os.getenv("LC_MODEL", os.getenv("GEMINI_MODEL", "gemini-1.5-flash")),
+            model=os.getenv("LC_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash")),
             temperature=float(os.getenv("LC_TEMPERATURE", "0")),
-            max_output_tokens=int(os.getenv("LC_MAX_TOKENS", "1024")),
+            max_output_tokens=int(os.getenv("LC_MAX_TOKENS", "256")),
         )
-        _PARSER = PydanticOutputParser(pydantic_object=Profile)
+        # Legacy structured prompt retained for easy rollback:
+        # _PROMPT = ChatPromptTemplate.from_messages([
+        #     (
+        #         "system",
+        #         (
+        #             "You are Compass, a relocation assistant. Respond with exactly one JSON object "
+        #             "that matches the structured schema you have been given."
+        #         ),
+        #     ),
+        #     (
+        #         "system",
+        #         (
+        #             "Schema definition and formatting rules:\n{format_instructions}\n"
+        #             "Do not echo these instructions in fields other than assistant_reply."
+        #         ),
+        #     ),
+        #     (
+        #         "system",
+        #         (
+        #             "{system_feedback}"
+        #         ),
+        #     ),
+        #     ("human", "CONVERSATION_HISTORY:\n{conversation_history}\n\nCURRENT_PROFILE_JSON:\n{current_profile}\n\nLATEST_USER_MESSAGE:\n{user_message}\n\nRespond only with JSON."),
+        # ]).partial(
+        #     system_feedback="",
+        # )
         _PROMPT = ChatPromptTemplate.from_messages([
             (
                 "system",
-                f"""
-You are a relocation profile builder. Given the CURRENT_PROFILE (a JSON object) and the latest USER_MESSAGE, produce a COMPLETE Profile JSON that best reflects the user's preferences.
-Ask clarifying questions across turns until you are at least 85% confident in the profile. When you are confident, do not ask more questions—just update the JSON.
-Rules:
-- Only change fields you are confident about based on the USER_MESSAGE.
-- Keep unspecified fields the same as CURRENT_PROFILE.
-- For list fields, append new values and avoid duplicates.
-- Be concise: do not invent details, use only what the user implies.
-- Output JSON only, no extra text.
-- When the profile is NOT ready, include a single clear clarifying question at notes.next_question.
-- When the profile IS ready, set notes.ready=true and omit notes.next_question.
-- When gathering qualitative ratings (climate, transit, safety, healthcare, education, arts, recreation, economy, population), list the acceptable descriptors, require the user to choose from them, and if they answer with something else, ask again and repeat the acceptable options.
-- Phrase qualitative questions as preference prompts (e.g., "Which safety option best matches what you want? Choose from: ...") rather than asking "How important is ___?"
-- Acceptable qualitative descriptors:\n{QUALITATIVE_GUIDANCE_TEXT}
-- Location rules: set hard_filters.country only when the user names a country (e.g., "United States"). Set hard_filters.state only when the user explicitly mentions a state by name; otherwise leave it null. Never guess states.
- - Default scope: unless the user names a different country, assume the search is within the United States and set hard_filters.country = "United States".
-{{format_instructions}}
-                """.strip(),
+                (
+                    "You are Compass, a US relocation assistant. Output ONE JSON line that matches the schema. "
+                    "Only collect: climate, transit, safety, healthcare, education, arts, recreation, economy, population/size, housing budget, optional state/country. "
+                    "If the user message contains ANY of these, update the corresponding profile fields immediately (do not wait to ask again). "
+                    "For scores, infer a 0–10 numeric value when possible; for climate, use hot/warm/temperate/mild/cool/cold/tropical; for population, set a numeric minimum if a size is implied (e.g., 'big city' => 1_000_000). "
+                    "If nothing new is provided, ask the next missing field. Short, complete sentences; no ellipses; no extra keys. Stay concise and friendly."
+                ),
             ),
-            ("human", "CURRENT_PROFILE:\n{current_profile}\n\nUSER_MESSAGE:\n{user_message}"),
-        ])
-    except Exception:
+            (
+                "system",
+                "Structured output rules:\n{structure_instructions}\nDo not restate these instructions; put only conversational text in assistant_reply.",
+            ),
+            (
+                "system",
+                "{system_feedback}",
+            ),
+            (
+                "human",
+                "HISTORY:\n{conversation_history}\nPROFILE:\n{current_profile}\nUSER:\n{user_message}\nReturn only JSON.",
+            ),
+        ]).partial(
+            system_feedback="",
+            structure_instructions=STRUCTURE_INSTRUCTIONS,
+        )
+        print("LLM init complete.")
+    except Exception as exc:
+        print("LLM INIT FAILED:", type(exc).__name__, exc)
         _LLM = None
-        _PARSER = None
         _PROMPT = None
 
 
 def stepAgent(profile: Profile, message: str) -> Profile:
-    """Single turn of the conversation: update and return the Profile.
-
-    If LangChain + an LLM are configured, we use structured output to produce a
-    full Profile and then merge it with the incoming one. Otherwise, we fall
-    back to a small heuristic updater.
-    """
+    """Single conversational turn handled purely by the Gemini agent."""
     incoming_message = message or ""
     if not isinstance(profile.notes, dict):
         profile.notes = {}
     notes = profile.notes
     has_prev_turns = bool(notes.get("turns"))
-    previous_question = notes.get("next_question") or notes.get("_last_question")
+    previous_question = notes.get("_last_question")
+    state_before = profile.model_dump()
 
-    if not (_LLM and _PARSER and _PROMPT):
-        return _heuristic_update(profile, incoming_message)
+    if not _LLM:
+        print("stepAgent aborting: LLM stack not ready.")
+        raise RuntimeError(
+            "Gemini chat agent is not configured. "
+            "Set GOOGLE_API_KEY / GEMINI_MODEL and restart the backend."
+        )
 
     if not has_prev_turns and not incoming_message.strip():
         _ensure_initial_question(profile)
         notes.setdefault("turns", [])
         notes["ready"] = False
+        notes.setdefault(
+            "response",
+            "Hi! Tell me a bit about your ideal city so I can start building your profile.",
+        )
         return profile
 
-    if "next_question" in notes:
-        notes["_last_question"] = notes.get("next_question")
-        notes.pop("next_question", None)
+    # Build prompt focusing on LLM-driven flow (assistant_reply + fenced profile block)
+    history_text = _format_history_for_prompt(notes.get("chat_history"))
+    current_profile_json = _profile_json_for_prompt(profile)
+    user_msg = incoming_message.strip()
+    prompt = (
+        "You are Compass, a professional yet warm US relocation assistant.\n"
+        "On each turn you must:\n"
+        "1) Give a short assistant reply to the user (keep it concise and friendly).\n"
+        "2) Update any fields you can infer and output them inside a fenced block exactly like:\n"
+        "```profile\n"
+        "climate: <hot|warm|temperate|mild|cool|cold|tropical or blank>\n"
+        "transit: <0-10 or blank>\n"
+        "safety: <0-10 or blank>\n"
+        "healthcare: <0-10 or blank>\n"
+        "education: <0-10 or blank>\n"
+        "arts: <short text or blank>\n"
+        "recreation: <short text or blank>\n"
+        "economy: <0-10 or blank>\n"
+        "population: <numeric minimum or blank>\n"
+        "budget: <monthly housing USD number or blank>\n"
+        "next_question: <one concise follow-up for the most important missing field>\n"
+        "```\n"
+        "Rules:\n"
+        "- Keep numbers 0–10 where applicable; you may infer decimals up to 15 places but keep the string short.\n"
+        "- Population is numeric (e.g., 1000000 for a big city). Budget is numeric USD (accept $ or commas in user text, output plain number).\n"
+        "- If you cannot infer a field, leave it blank. Do not invent extra keys. Always include next_question.\n"
+        "- Stay concise; no extra fences or commentary. The user-facing reply must stay outside the fenced block. Always end with a question to the user, never end with a statement and only about the fields stated above nothing else, stick to the script.\n\n"
+        f"HISTORY (recent):\n{history_text}\n\n"
+        f"CURRENT_PROFILE_JSON:\n{current_profile_json}\n\n"
+        f"LATEST_USER_MESSAGE:\n{user_msg or 'None'}\n"
+        "Produce the assistant reply, then the fenced profile block."
+    )
 
-    current_profile_json = profile.model_dump_json()
-    format_instructions = _PARSER.get_format_instructions()
-
-    # Run chain: prompt → llm → parse
+    # Call LLM
     try:
-        chain = _PROMPT | _LLM | _PARSER
-        new_profile: Profile = chain.invoke({
-            "current_profile": current_profile_json,
-            "user_message": incoming_message,
-            "format_instructions": format_instructions,
-        })
+        llm_output_text = _coerce_message_text(_LLM.invoke([HumanMessage(content=prompt)])).strip()
     except Exception:
-        # If anything goes wrong, gracefully fall back
-        return _heuristic_update(profile, incoming_message)
+        # Fall back to deterministic flow on error
+        _finalize_turn(profile, notes, has_prev_turns, incoming_message)
+        return profile
 
-    # Merge and return
-    merged = _merge_profiles(profile, new_profile)
-    # Ensure notes is a dict
-    if not isinstance(merged.notes, dict):
-        merged.notes = {}
-    if previous_question:
-        merged.notes["_awaiting_question"] = previous_question
-    _normalize_qualitative_answers(merged)
-    _refresh_questionnaire_state(merged)
-    # Apply lightweight heuristics to fill obvious fields the model may omit
-    _post_update_heuristics(merged, incoming_message, has_prev_turns)
-    _set_qualitative_options_note(merged)
-    turns = merged.notes.setdefault("turns", [])
-    if incoming_message:
-        if not turns or turns[-1] != incoming_message:
-            turns.append(incoming_message)
-    elif not turns:
-        turns.append(incoming_message)
-    clarification_handled = _maybe_handle_clarification(merged, incoming_message)
-    captured_answers = False
-    handled_binary = False
-    if not clarification_handled:
-        captured_answers = _capture_qualitative_answers(merged, incoming_message)
-        handled_binary = _handle_binary_questions(merged, incoming_message)
-        if (captured_answers or handled_binary) and "next_question" in merged.notes and not merged.notes.get("pending_fields"):
-            merged.notes.pop("next_question", None)
-        if captured_answers or handled_binary:
-            _refresh_questionnaire_state(merged)
-    qualitative_guidance = [] if clarification_handled else _ensure_qualitative_alignment(merged)
-    if qualitative_guidance:
-        merged.notes["next_question"] = " ".join(qualitative_guidance)
-        merged.notes["_last_question"] = merged.notes["next_question"]
-        merged.notes.pop("pending_fields", None)
-        merged.notes["ready"] = False
-    elif clarification_handled:
-        merged.notes["ready"] = False
+    assistant_reply, parsed_block = _parse_llm_profile_block(llm_output_text)
+    _apply_parsed_profile(profile, parsed_block)
+
+    # Lightweight deterministic inference as a safety net
+    _capture_qualitative_answers(profile, user_msg)
+    _post_update_heuristics(profile, user_msg or "", has_prev_turns)
+    _normalize_qualitative_answers(profile)
+    _refresh_questionnaire_state(profile)
+
+    # Track history
+    history = notes.get("chat_history")
+    if not isinstance(history, list):
+        history = []
+        notes["chat_history"] = history
+    if user_msg:
+        _append_history_entry(history, "user", user_msg)
+    if assistant_reply:
+        _append_history_entry(history, "assistant", assistant_reply)
+
+    # Determine readiness and next question
+    missing = _missing_fields(profile)
+    ready = False
+    try:
+        ready = is_profile_ready(profile)
+    except Exception:
+        ready = False
+    notes["ready"] = ready
+
+    next_q = parsed_block.get("next_question") if isinstance(parsed_block, dict) else None
+    if not next_q and not ready and missing:
+        field = "budget" if "budget" in missing else missing[0]
+        next_q = _question_for_key(field) or "Can you tell me a bit more?"
+
+    notes["next_question"] = None if ready else next_q
+    notes["_last_question"] = None if ready else next_q
+
+    # response shown to user
+    if ready:
+        notes["response"] = assistant_reply or "Thanks! I have what I need. Let me fetch recommendations."
+        notes.pop("pending_fields", None)
+        notes.pop("next_action", None)
     else:
-        if not merged.notes.get("next_question"):
-            _advance_questionnaire(merged)
-        try:
-            ready = is_profile_ready(merged)
-        except Exception:
-            ready = False
-        merged.notes["ready"] = ready
-        if ready:
-            merged.notes["next_action"] = {
-                "type": "search_places",
-                "params": {
-                    "topK": 20,
-                    "take": 5
-                }
-            }
-            merged.notes.pop("next_question", None)
-            merged.notes.pop("pending_fields", None)
+        # Prefer to show both the assistant reply and the next question so the user knows what to answer.
+        if assistant_reply and next_q:
+            notes["response"] = f"{assistant_reply} {next_q}"
         else:
-            merged.notes.pop("next_action", None)
-            if not merged.notes.get("next_question"):
-                question, fields = _determine_next_question(merged)
-                if question:
-                    merged.notes["next_question"] = question
-                    merged.notes["pending_fields"] = fields
-                    merged.notes["_last_question"] = question
-                else:
-                    nq = _default_next_question(merged)
-                    if nq:
-                        merged.notes.pop("pending_fields", None)
-                        merged.notes["next_question"] = nq
-                        merged.notes["_last_question"] = nq
-    return merged
+            notes["response"] = assistant_reply or next_q or "Can you share a bit more?"
+        if missing:
+            notes["pending_fields"] = [f for f in missing if f != "budget"]
+
+    # Track turns
+    turns = notes.setdefault("turns", [])
+    if user_msg:
+        turns.append(user_msg)
+    if assistant_reply:
+        turns.append(assistant_reply)
+
+    return profile
 
 
 def _post_update_heuristics(profile: Profile, message: str, has_prev_turns: bool) -> None:
@@ -1188,6 +1631,8 @@ def _post_update_heuristics(profile: Profile, message: str, has_prev_turns: bool
     Runs after the LLM merge to improve robustness in local/dev runs.
     """
     m = (message or "").lower()
+    notes = profile.notes if isinstance(profile.notes, dict) else {}
+    last_q = (notes.get("_last_question") or "").lower()
 
     # Remote preference
     if profile.wants_remote_friendly is None and any(tok in m for tok in ["remote", "work from home", "wfh"]):
@@ -1203,6 +1648,319 @@ def _post_update_heuristics(profile: Profile, message: str, has_prev_turns: bool
                     profile.budget_monthly_usd = amt
             except Exception:
                 pass
+
+    # Population from qualitative hints
+    if profile.population_min is None:
+        pop_val = None
+        if "big city" in m or "metropolis" in m or "large city" in m:
+            pop_val = 1_000_000
+        elif "mid" in m or "medium city" in m or "mid-size" in m:
+            pop_val = 200_000
+        elif "small town" in m or "small city" in m:
+            pop_val = 50_000
+        pop_note = None
+        try:
+            pop_note = notes.get("population")
+        except Exception:
+            pop_note = None
+        if isinstance(pop_note, str):
+            pn = pop_note.lower()
+            if "large" in pn or "big" in pn:
+                pop_val = pop_val or 1_000_000
+            elif "mid" in pn:
+                pop_val = pop_val or 200_000
+            elif "small" in pn:
+                pop_val = pop_val or 50_000
+        if pop_val:
+            profile.population_min = float(pop_val)
+
+    # Normalize improbable population values (discard tiny numbers that look like scores)
+    if profile.population_min is not None and profile.population_min < 1000:
+        profile.population_min = None
+
+    # Map numeric answers to the field we just asked about
+    def _maybe_number(text: str) -> Optional[float]:
+        try:
+            val = float(text)
+            if 0 <= val <= 10:
+                return val
+        except Exception:
+            return None
+        return None
+
+    if message:
+        msg_clean = message.strip()
+        num = _maybe_number(msg_clean)
+        if num is not None:
+            if "transit" in last_q:
+                profile.transit_min_score = num
+            elif "safety" in last_q:
+                profile.safety_min_score = num
+            elif "healthcare" in last_q:
+                profile.healthcare_min_score = num
+            elif "education" in last_q:
+                profile.education_min_score = num
+            elif "economy" in last_q:
+                profile.economy_score_min = num
+            elif "climate" in last_q:
+                profile.climate_score_min = num
+            elif "arts" in last_q:
+                notes["arts"] = msg_clean
+            elif "recreation" in last_q:
+                notes["recreation"] = msg_clean
+        else:
+            # Non-numeric answers for arts/recreation still count as filled
+            if "arts" in last_q:
+                notes["arts"] = msg_clean
+            if "recreation" in last_q:
+                notes["recreation"] = msg_clean
+            if "climate" in last_q:
+                syn = _QUAL_FIELD_INFO["climate"]["synonyms"]
+                m_lower = msg_clean.lower()
+                for key, val in syn.items():
+                    if key in m_lower:
+                        if val not in profile.preferred_climates:
+                            profile.preferred_climates.append(val)
+                        break
+
+
+def _apply_answer_from_last_question(profile: Profile, notes: Dict[str, Any], last_q: str, message: str) -> bool:
+    """Map a user answer directly to the field implied by the last question. Returns True if applied."""
+    if not message:
+        return False
+    msg_clean = message.strip()
+    m_lower = msg_clean.lower()
+
+    def _maybe_number(text: str) -> Optional[float]:
+        frac = re.match(r"\s*(\d+(?:\.\d+)?)\s*/\s*10\s*$", text)
+        if frac:
+            try:
+                return float(frac.group(1))
+            except Exception:
+                pass
+        try:
+            val = float(text)
+            return val
+        except Exception:
+            return None
+
+    num = _maybe_number(msg_clean)
+    applied = False
+
+    def _apply_population_from_words(text: str) -> bool:
+        import re
+        t = text.lower()
+        words = re.findall(r"[a-z0-9]+", t) or []
+        tokens = set(words) if isinstance(words, list) else set()
+        if tokens & {"huge", "metropolis", "mega", "giant", "massive", "large", "big"}:
+            profile.population_min = 1_000_000
+            return True
+        if tokens & {"mid", "medium"} or any(re.search(r"\bmid[-\s]?size(d)?\b", t)):
+            profile.population_min = 200_000
+            return True
+        if tokens & {"small", "town"}:
+            profile.population_min = 50_000
+            return True
+        import re
+        m = re.search(r"([0-9][0-9.,]*)\s*(m|million)", t)
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+                profile.population_min = int(val * 1_000_000)
+                return True
+            except Exception:
+                return False
+        return False
+
+    def _apply_budget_from_text(text: str) -> bool:
+        import re
+        m = re.search(r"\$?\s*([0-9]{3,7}(?:,[0-9]{3})?)", text.replace("usd", ""))
+        if m:
+            try:
+                amt = int(m.group(1).replace(",", ""))
+                profile.budget_monthly_usd = amt
+                profile.housing_cost_target_max = float(amt)
+                return True
+            except Exception:
+                return False
+        return False
+    # Determine target field: prefer pending_fields[0], else infer from last question keywords
+    next_missing = None
+    if isinstance(notes.get("pending_fields"), list) and notes["pending_fields"]:
+        next_missing = notes["pending_fields"][0]
+    else:
+        if "budget" in last_q or "housing" in last_q:
+            next_missing = "budget"
+        elif "population" in last_q or "city size" in last_q:
+            next_missing = "population"
+        elif "climate" in last_q:
+            next_missing = "climate"
+        elif "transit" in last_q or "walk" in last_q or "car" in last_q:
+            next_missing = "transit"
+        elif "safety" in last_q or "crime" in last_q:
+            next_missing = "safety"
+        elif "health" in last_q:
+            next_missing = "healthcare"
+        elif "education" in last_q or "school" in last_q:
+            next_missing = "education"
+        elif "arts" in last_q or "culture" in last_q:
+            next_missing = "arts"
+        elif "recreation" in last_q or "outdoor" in last_q or "parks" in last_q:
+            next_missing = "recreation"
+        elif "economy" in last_q or "job" in last_q or "market" in last_q:
+            next_missing = "economy"
+
+    def _apply_numeric(target: str, value: Optional[float] = None):
+        nonlocal applied
+        val = num if value is None else value
+        if val is None:
+            return
+        if target == "transit":
+            profile.transit_min_score = val
+        elif target == "safety":
+            profile.safety_min_score = val
+        elif target == "healthcare":
+            profile.healthcare_min_score = val
+        elif target == "education":
+            profile.education_min_score = val
+        elif target == "economy":
+            profile.economy_score_min = val
+        elif target == "population" and val >= 1000:
+            profile.population_min = val
+        elif target == "budget":
+            profile.budget_monthly_usd = int(val)
+            profile.housing_cost_target_max = float(val)
+        else:
+            return
+        applied = True
+
+    # Heuristic importance mapping when a numeric is not given
+    if num is None and next_missing in {"transit", "safety", "healthcare", "education", "economy"}:
+        lower = m_lower
+        if any(phrase in lower for phrase in ["not important", "not a priority", "no school", "none needed"]):
+            _apply_numeric(next_missing, 1.0)
+        elif "very important" in lower or "critical" in lower:
+            _apply_numeric(next_missing, 8.5)
+        elif "important" in lower or "moderate" in lower:
+            _apply_numeric(next_missing, 6.0)
+
+    def _apply_qualitative(target: str):
+        nonlocal applied
+        if target == "climate":
+            climate_info = _QUAL_FIELD_INFO["climate"]
+            for label in climate_info["descriptions"].keys():
+                if label in m_lower or m_lower == label:
+                    if label not in profile.preferred_climates:
+                        profile.preferred_climates.append(label)
+                    applied = True
+                    return
+            syn = climate_info["synonyms"]
+            for key, val in syn.items():
+                if key in m_lower or m_lower == val:
+                    if val not in profile.preferred_climates:
+                        profile.preferred_climates.append(val)
+                    applied = True
+                    return
+        if target == "arts":
+            notes["arts"] = msg_clean
+            applied = True
+        if target == "recreation":
+            notes["recreation"] = msg_clean
+            applied = True
+        if target == "population":
+            if _apply_population_from_words(msg_clean):
+                applied = True
+        if target == "budget":
+            if _apply_budget_from_text(msg_clean):
+                applied = True
+
+    if next_missing:
+        if num is not None:
+            _apply_numeric(next_missing)
+        if not applied:
+            # Try qualitative→numeric mapping for numeric fields
+            dataset_field_map = {
+                "transit": "Transp",
+                "safety": "Crime",
+                "healthcare": "HlthCare",
+                "education": "Educ",
+                "economy": "Econ",
+                "climate": "Climate",
+            }
+            ds_field = dataset_field_map.get(next_missing)
+            if ds_field:
+                qscore = qualitative_to_numeric(ds_field, msg_clean)
+                if qscore is not None:
+                    _apply_numeric(next_missing, qscore)
+                    applied = True
+            # Extra heuristics for education importance wording
+            if not applied and next_missing == "education":
+                neg_phrases = ["not important", "not a priority", "not at all", "no", "none", "less of a priority", "don't care", "dont care"]
+                if any(p in m_lower for p in neg_phrases):
+                    _apply_numeric("education", 1.0)
+                elif "general" in m_lower:
+                    _apply_numeric("education", 5.0)
+                elif "top" in m_lower or "excellent" in m_lower or "great" in m_lower:
+                    _apply_numeric("education", 8.0)
+            if not applied:
+                _apply_qualitative(next_missing)
+    return applied
+
+
+def _extract_note_option(profile: Profile, field_key: str) -> Optional[str]:
+    """Fetch a stored qualitative answer for the given field, if any."""
+    notes: Dict[str, Any] = profile.notes if isinstance(profile.notes, dict) else {}
+    direct = notes.get(field_key)
+    if isinstance(direct, str):
+        return direct
+    qual_answers = notes.get("qual_answers")
+    if isinstance(qual_answers, dict):
+        ans = qual_answers.get(field_key)
+        if isinstance(ans, str):
+            return ans
+    return None
+
+
+def _generate_llm_question(field_key: str, profile: Profile, notes: Dict[str, Any]) -> Optional[str]:
+    """Let the LLM phrase a single, concise follow-up question for the given field."""
+    if _LLM is None:
+        return None
+    try:
+        last_user = ""
+        history = notes.get("chat_history") if isinstance(notes.get("chat_history"), list) else []
+        for entry in reversed(history):
+            if isinstance(entry, dict) and entry.get("role") == "user":
+                last_user = entry.get("content") or ""
+                break
+        prompt = (
+            "You are Compass, a professional yet warm relocation assistant. "
+            "Ask ONE concise follow-up for the single FIELD below. Be empathetic, natural, under 120 characters. "
+            "Do NOT repeat fields that are already answered; never ask about any other field than FIELD. "
+            "Infer 0–10 internally (carry up to 15 decimal places; do NOT show numbers) using this dataset guide, and if you cannot infer then just guess based off of your knowledge base:\n"
+            "- Climate (Climate): 0=cold/arctic, 5=temperate, 10=hot/tropical. Warm/hot year-round ~8–10; temperate ~5–6; cold ~2–4.\n"
+            "- HousingCost (HousingCost): 0=very affordable, 10=very expensive. 'Affordable' ~1–3; 'moderate' ~4–6; 'expensive' ~7–9.\n"
+            "- Safety (Crime): 0=very safe/low crime, 10=unsafe/high crime. 'Very safe' ~1–2; 'moderate' ~5–6.\n"
+            "- Transp (Transp): 0=car dependent, 10=excellent transit/walkability. 'Walkable/transit-friendly' ~8–10; 'car required' ~1–3.\n"
+            "- HlthCare (HlthCare): 0=poor, 10=excellent hospitals nearby. 'Top hospitals nearby' ~8–10; 'average' ~5–6.\n"
+            "- Educ (Educ): 0=not important/low quality, 10=top schools. 'Top schools' ~8–10; 'not important' ~1–2.\n"
+            "- Arts (Arts): 0=very limited, 10=vibrant/rich. 'Vibrant arts' ~8–10; 'limited' ~1–3.\n"
+            "- Recreat (Recreat): 0=few options, 10=abundant trails/beaches/parks. 'Lots of hiking/beaches' ~8–10; 'limited' ~1–3.\n"
+            "- Econ (Econ): 0=weak job market, 10=booming. 'Strong/booming' ~8–10; 'steady/average' ~5–6.\n"
+            "- Pop (Pop): 0=small towns, 10=largest metros. Small town ~50k (1–2); mid ~200k (4–6); big/major/metropolis ~1M+ (8–10).\n"
+            "- Budget: monthly housing in USD; accept $, commas, or plain numbers.\n"
+            "Examples to guide your wording only: 'warm and walkable' => climate ~8–10, transit ~8–10; "
+            "'moderate safety' => safety ~5–6; 'big city' => pop ~8–10; 'affordable housing' => housing ~1–3. "
+            "Keep tone conversational and field-specific, and always end with a question to the user not a statement. Do not echo numbers. Ask only about FIELD.\n\n"
+            f"FIELD: {field_key}\n"
+            f"LAST_USER_MESSAGE: {last_user}\n"
+            "Reply with ONLY the question text."
+        )
+        msg = HumanMessage(content=prompt)
+        reply = _coerce_message_text(_LLM.invoke([msg])).strip()
+        return reply if reply else None
+    except Exception:
+        return None
+
 
     # Climate hints and normalization
     if isinstance(profile.preferred_climates, list):
@@ -1263,34 +2021,130 @@ def _post_update_heuristics(profile: Profile, message: str, has_prev_turns: bool
 
 def _default_next_question(profile: Profile) -> Optional[str]:
     """Fallback clarifying question when the model doesn't provide one."""
-    if profile.budget_monthly_usd is None:
-        return "What is your approximate monthly housing budget (in USD)?"
-    question, _fields = _determine_next_question(profile)
-    if question:
-        return question
-    if not (profile.hard_filters and (profile.hard_filters.country or profile.hard_filters.state)):
-        return "Which country or state do you want to focus on?"
-    if not profile.commute_preference:
-        return "Do you prefer walkable areas, good transit, or driving?"
-    if profile.wants_remote_friendly is None:
-        return REMOTE_PREFERENCE_PROMPT
-    notes = profile.notes if isinstance(profile.notes, dict) else {}
-    if not notes.get("declined_additional_must_haves"):
-        return MUST_HAVE_PROMPT
-    return None
+    missing = _missing_fields(profile)
+    if not missing:
+        return None
+    key = "budget" if "budget" in missing else missing[0]
+    return _question_for_key(key)
+
+
+def _finalize_turn(profile: Profile, notes: Dict[str, Any], has_prev_turns: bool, incoming_message: str) -> None:
+    """Finalize a turn without relying on LLM next_question."""
+    turns = notes.setdefault("turns", [])
+    if incoming_message and (not turns or turns[-1] != incoming_message):
+        turns.append(incoming_message)
+
+    history = notes.get("chat_history")
+    if not isinstance(history, list):
+        history = []
+        notes["chat_history"] = history
+    if incoming_message:
+        _append_history_entry(history, "user", incoming_message)
+
+    _normalize_qualitative_answers(profile)
+    _refresh_questionnaire_state(profile)
+    _post_update_heuristics(profile, incoming_message or "", has_prev_turns)
+    manual_qual = _capture_qualitative_answers(profile, incoming_message or "")
+    if manual_qual:
+        _refresh_questionnaire_state(profile)
+
+    missing_fields = _missing_fields(profile)
+    if missing_fields:
+        notes["pending_fields"] = [f for f in missing_fields if f != "budget"]
+    else:
+        notes.pop("pending_fields", None)
+
+    try:
+        ready = is_profile_ready(profile)
+    except Exception:
+        ready = False
+    notes["ready"] = ready
+
+    if ready:
+        notes.pop("next_question", None)
+        notes.pop("_last_question", None)
+        notes.pop("next_action", None)
+        notes["response"] = "Thanks! I have what I need. Let me fetch recommendations."
+    else:
+        field_for_question = None
+        if notes.get("pending_fields"):
+            field_for_question = notes["pending_fields"][0]
+        elif "budget" in missing_fields:
+            field_for_question = "budget"
+        if field_for_question:
+            qtext = _generate_llm_question(field_for_question, profile, notes) or _question_for_key(field_for_question)
+            if qtext:
+                notes["next_question"] = qtext
+                notes["_last_question"] = qtext
+                # Always set the bot response to the next question to prompt the user
+                notes["response"] = qtext
+        else:
+            notes.pop("next_question", None)
+        notes.pop("next_action", None)
 
 
 # Optional readiness check the frontend can use (imported from here)
 
 def is_profile_ready(profile: Profile) -> bool:
-    """Define your own readiness criteria for moving on to search/recommend.
-    Example heuristic: budget, at least one climate preference, and either
-    industry or remote preference.
-    """
-    has_budget = profile.budget_monthly_usd is not None
+    """Profile is ready when required fields are filled."""
+    notes = profile.notes if isinstance(profile.notes, dict) else {}
+    pending = notes.get("pending_fields") if isinstance(notes.get("pending_fields"), list) else []
+    if pending:
+        return False
+
+    required_numeric = [
+        profile.transit_min_score,
+        profile.safety_min_score,
+        profile.healthcare_min_score,
+        profile.economy_score_min,
+    ]
+    has_required_scores = all(v is not None for v in required_numeric)
     has_climate = bool(profile.preferred_climates)
-    has_work = bool(profile.industry) or (profile.wants_remote_friendly is not None)
-    return has_budget and has_climate and has_work
+    has_budget = profile.budget_monthly_usd is not None or profile.housing_cost_target_max is not None
+    has_population = profile.population_min is not None
+
+    return has_required_scores and has_climate and has_budget and has_population
+
+
+def _missing_fields(profile: Profile) -> List[str]:
+    missing: List[str] = []
+    if not profile.preferred_climates and profile.climate_score_min is None:
+        missing.append("climate")
+    if profile.transit_min_score is None:
+        missing.append("transit")
+    if profile.safety_min_score is None:
+        missing.append("safety")
+    if profile.healthcare_min_score is None:
+        missing.append("healthcare")
+    if profile.education_min_score is None:
+        missing.append("education")
+    if _extract_note_option(profile, "arts") is None:
+        missing.append("arts")
+    if _extract_note_option(profile, "recreation") is None:
+        missing.append("recreation")
+    if profile.economy_score_min is None:
+        missing.append("economy")
+    if profile.population_min is None:
+        missing.append("population")
+    if profile.budget_monthly_usd is None and profile.housing_cost_target_max is None:
+        missing.append("budget")
+    return missing
+
+
+def _question_for_key(key: str) -> Optional[str]:
+    questions = {
+        "climate": "Climate: which suits you (hot, warm, temperate, mild, cool, cold)?",
+        "transit": "Transit/Walkability: do you want walkable or transit-friendly, or is car-dependent okay?",
+        "safety": "Safety: describe what feels right (very safe/low crime vs okay with moderate crime).",
+        "healthcare": "Healthcare: what quality/access do you expect (excellent, good, average, limited)?",
+        "education": "Education: how important are schools (top, excellent, good, average, not important)?",
+        "arts": "Arts/Culture: what level fits you (vibrant/rich, moderate, limited)?",
+        "recreation": "Recreation/Outdoors: what do you want (abundant trails/beaches, good parks, limited)?",
+        "economy": "Economy/Jobs: what strength do you seek (booming/strong/steady/weak)?",
+        "population": "City size: small town (~50k), mid-size (~200k), big city (~1M+)?",
+        "budget": "Budget: your approximate monthly housing budget (USD)?",
+    }
+    return questions.get(key)
 
 
 # Optional helper: allow caller to inject a callback that runs search/recommend

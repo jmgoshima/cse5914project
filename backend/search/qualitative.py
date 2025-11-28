@@ -51,6 +51,10 @@ QUALITATIVE_FIELD_KEYWORDS: Dict[str, Dict[str, float]] = {
         "walkable": 7.5,
     },
     "hlthcare": {
+        "not important": 1.0,
+        "not a priority": 1.0,
+        "very important": 8.5,
+        "important": 7.0,
         "poor": 2.5,
         "limited": 3.5,
         "average": 5.0,
@@ -59,6 +63,12 @@ QUALITATIVE_FIELD_KEYWORDS: Dict[str, Dict[str, float]] = {
         "excellent": 8.5,
     },
     "educ": {
+        "not important": 1.0,
+        "not a priority": 1.0,
+        "no school": 1.0,
+        "none": 1.0,
+        "very important": 8.0,
+        "important": 7.0,
         "poor": 3.0,
         "average": 5.0,
         "good": 7.0,
@@ -83,6 +93,9 @@ QUALITATIVE_FIELD_KEYWORDS: Dict[str, Dict[str, float]] = {
         "abundant": 8.5,
     },
     "econ": {
+        "not important": 1.0,
+        "very important": 8.5,
+        "important": 7.0,
         "weak": 3.0,
         "average": 5.0,
         "steady": 6.0,

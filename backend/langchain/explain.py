@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import os
 import logging
+from pathlib import Path
 from typing import Optional
 
 # Load .env if present so GOOGLE_API_KEY is available locally
 try:  # pragma: no cover
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
 except Exception:  # pragma: no cover
     pass
 

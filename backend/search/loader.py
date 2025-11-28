@@ -17,6 +17,11 @@ from backend.search.es_client import get_client  # type: ignore
 
 env_path_relative = Path(__file__).parent.parent.parent / "elastic-start-local" / ".env"
 load_dotenv(dotenv_path=env_path_relative)
+# Propagate local creds to the standard vars expected by the client
+if not os.getenv("ES_PASSWORD") and os.getenv("ES_LOCAL_PASSWORD"):
+    os.environ["ES_PASSWORD"] = os.getenv("ES_LOCAL_PASSWORD")
+if not os.getenv("ES_USERNAME") and os.getenv("ES_LOCAL_USER"):
+    os.environ["ES_USERNAME"] = os.getenv("ES_LOCAL_USER")
 
 # 1. Clean and Normalize Data
 

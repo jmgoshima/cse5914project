@@ -1,9 +1,16 @@
 from __future__ import annotations
 import os, json, uuid, threading, queue
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Optional, Tuple, List
 from flask import Flask, jsonify, request, g, Blueprint, Response, stream_with_context
 from flask_cors import CORS
+
+try:  # ensure Gemini creds load when app boots
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except Exception:
+    pass
 
 # ---- your modules (heavy lifting lives here) ----
 from backend.langchain.conversation import stepAgent             # agent: fills Profile
@@ -527,4 +534,9 @@ def create_app() -> Flask:
 
 if __name__ == "__main__":
     app = create_app()
-    app.run(host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8080")), debug=os.getenv("FLASK_DEBUG", "false").lower()=="true")
+    debug_mode = os.getenv("FLASK_DEBUG", "true").lower() == "true"
+    app.run(
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8080")),
+        debug=debug_mode,
+    )
