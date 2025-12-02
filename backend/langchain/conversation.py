@@ -31,15 +31,6 @@ from pydantic import BaseModel, Field
 #     pass
 
 
-
-# Temporary hardcoded Gemini creds to guarantee the agent initializes locally.
-HARDCODED_GOOGLE_API_KEY = "AIzaSyBxNcTpTuCM7OyG_uuRGOXeuBZhTbwFn38"
-# Old default model kept here for reference:
-# HARDCODED_GEMINI_MODEL = "gemini-2.5-flash"
-HARDCODED_GEMINI_MODEL = "gemini-1.5-flash"
-os.environ.setdefault("GOOGLE_API_KEY", HARDCODED_GOOGLE_API_KEY)
-os.environ.setdefault("GEMINI_MODEL", HARDCODED_GEMINI_MODEL)
-
 from .schemas import Profile
 from backend.search.qualitative import qualitative_to_numeric
 
