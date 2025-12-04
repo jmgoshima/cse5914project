@@ -124,6 +124,7 @@ function App() {
   ]);
   const [isTyping, setIsTyping] = useState(false);
   const [conversationID, setConversationID] = useState(null);
+  const [page, setPage] = useState("home")
 
   // Initialize conversation when app starts
   useEffect(() => {
@@ -150,6 +151,13 @@ function App() {
 
     initializeConversation();
   }, []);
+
+  useEffect(() => {
+    if (cityResult) {
+      setPage("city");
+    }
+  }, [cityResult]);
+
   const [cityResult, setCityResult] = useState(null);
   const [isWaitingForCity, setIsWaitingForCity] = useState(false);
 
@@ -236,7 +244,23 @@ function App() {
       setIsTyping(false);
       setIsWaitingForCity(false);
     }
+
+    
   };
+
+  const handleBackHome = () => {
+    setPage("home");
+    setCityResult(null);
+  };
+
+  if (page === "city") {
+    return (
+      <CityPage
+        result={cityResult}
+        onBack={handleBackHome}
+      />
+    );
+  }
 
   return (
     <div className="page">
