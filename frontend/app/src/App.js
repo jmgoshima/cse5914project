@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import ChatWindow from "./components/ChatWindow";
 import ChatInput from "./components/ChatInput";
 import CityRecommendations from "./components/CityRecommendations";
+import CityPage from "./components/CityPage"
 import "./App.css";
 
 const HOW_TO_STEPS = [
@@ -152,14 +153,15 @@ function App() {
     initializeConversation();
   }, []);
 
+  const [cityResult, setCityResult] = useState(null);
   useEffect(() => {
     if (cityResult) {
       setPage("city");
     }
   }, [cityResult]);
 
-  const [cityResult, setCityResult] = useState(null);
   const [isWaitingForCity, setIsWaitingForCity] = useState(false);
+  
 
   const handleSend = async (message) => {
     if (!message.trim()) {
@@ -291,7 +293,7 @@ function App() {
                 <li key={index} className="how-to-step">
                   <span className="step-number">{index + 1}</span>
                   <p>{step}</p>
-                </li>
+                </li> 
               ))}
             </ol>
           </div>

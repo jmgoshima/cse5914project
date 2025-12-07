@@ -498,12 +498,11 @@ const CityRecommendations = ({
                       }}
                     />
                   </span>
-                </dt>
-                <dd>
-                  <span className="city-profile-value">
+
+                  <span className="city-profile-value-under">
                     {typeof value === "number" ? value.toFixed(1) : value}
                   </span>
-                </dd>
+                </dt>
               </React.Fragment>
             ))}
           </dl>
