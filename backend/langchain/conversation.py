@@ -37,13 +37,12 @@ from backend.search.qualitative import qualitative_to_numeric
 # --- Optional LangChain imports (graceful fallback if missing) ------------
 _LC_AVAILABLE = True
 try:
-    import google.generativeai as genai
-    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_openai import ChatOpenAI
     from langchain_core.messages import BaseMessage, HumanMessage
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.exceptions import OutputParserException
 except Exception as exc:  # pragma: no cover
-    print("LangChain Gemini imports failed:", type(exc).__name__, exc)
+    print("LangChain OpenAI imports failed:", type(exc).__name__, exc)
     _LC_AVAILABLE = False
 
 
@@ -574,15 +573,14 @@ def _append_history_entry(history: List[Dict[str, str]], role: str, content: str
         del history[: len(history) - _CHAT_HISTORY_LIMIT]
 
 
-def _coerce_message_text(output: Any) -> str:
-    if isinstance(output, BaseMessage):
-        return _coerce_message_text(output.content)
-    if isinstance(output, list):
-        parts = [_coerce_message_text(item) for item in output]
-        return "\n".join(part for part in parts if part)
-    if output is None:
-        return ""
-    return str(output)
+def _coerce_message_text(msg) -> str:
+    """Extract text content from a LangChain message object."""
+    if hasattr(msg, 'content'):
+        return str(msg.content)
+    elif isinstance(msg, str):
+        return msg
+    else:
+        return str(msg)
 
 
 def _build_retry_feedback(error: Exception, raw_text: str) -> str:
@@ -1418,68 +1416,16 @@ def _apply_parsed_profile(profile: Profile, data: Dict[str, str]) -> None:
 _LLM = None
 if _LC_AVAILABLE:
     try:  # lazy, tolerate missing keys
-        api_key = os.getenv("GOOGLE_API_KEY")
+        api_key = os.getenv("OPENAI_API_KEY")
         print("LLM init: API key present?", bool(api_key))
         if not api_key:
-            raise RuntimeError("GOOGLE_API_KEY is not set; cannot configure Gemini.")
-        genai.configure(api_key=api_key)
-        _LLM = ChatGoogleGenerativeAI(
-            model=os.getenv("LC_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash")),
+            raise RuntimeError("OPENAI_API_KEY is not set; cannot configure OpenAI.")
+        
+        _LLM = ChatOpenAI(
+            model=os.getenv("LC_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")),  # or "gpt-4o" for better quality
             temperature=float(os.getenv("LC_TEMPERATURE", "0")),
-            max_output_tokens=int(os.getenv("LC_MAX_TOKENS", "256")),
-        )
-        # Legacy structured prompt retained for easy rollback:
-        # _PROMPT = ChatPromptTemplate.from_messages([
-        #     (
-        #         "system",
-        #         (
-        #             "You are Compass, a relocation assistant. Respond with exactly one JSON object "
-        #             "that matches the structured schema you have been given."
-        #         ),
-        #     ),
-        #     (
-        #         "system",
-        #         (
-        #             "Schema definition and formatting rules:\n{format_instructions}\n"
-        #             "Do not echo these instructions in fields other than assistant_reply."
-        #         ),
-        #     ),
-        #     (
-        #         "system",
-        #         (
-        #             "{system_feedback}"
-        #         ),
-        #     ),
-        #     ("human", "CONVERSATION_HISTORY:\n{conversation_history}\n\nCURRENT_PROFILE_JSON:\n{current_profile}\n\nLATEST_USER_MESSAGE:\n{user_message}\n\nRespond only with JSON."),
-        # ]).partial(
-        #     system_feedback="",
-        # )
-        _PROMPT = ChatPromptTemplate.from_messages([
-            (
-                "system",
-                (
-                    "You are Compass, a US relocation assistant. Output ONE JSON line that matches the schema. "
-                    "Only collect: climate, transit, safety, healthcare, education, arts, recreation, economy, population/size, housing budget, optional state/country. "
-                    "If the user message contains ANY of these, update the corresponding profile fields immediately (do not wait to ask again). "
-                    "For scores, infer a 0–10 numeric value when possible; for climate, use hot/warm/temperate/mild/cool/cold/tropical; for population, set a numeric minimum if a size is implied (e.g., 'big city' => 1_000_000). "
-                    "If nothing new is provided, ask the next missing field. Short, complete sentences; no ellipses; no extra keys. Stay concise and friendly."
-                ),
-            ),
-            (
-                "system",
-                "Structured output rules:\n{structure_instructions}\nDo not restate these instructions; put only conversational text in assistant_reply.",
-            ),
-            (
-                "system",
-                "{system_feedback}",
-            ),
-            (
-                "human",
-                "HISTORY:\n{conversation_history}\nPROFILE:\n{current_profile}\nUSER:\n{user_message}\nReturn only JSON.",
-            ),
-        ]).partial(
-            system_feedback="",
-            structure_instructions=STRUCTURE_INSTRUCTIONS,
+            max_tokens=int(os.getenv("LC_MAX_TOKENS", "256")),
+            api_key=api_key,  # OpenAI takes api_key in constructor
         )
         print("LLM init complete.")
     except Exception as exc:
@@ -1489,7 +1435,7 @@ if _LC_AVAILABLE:
 
 
 def stepAgent(profile: Profile, message: str) -> Profile:
-    """Single conversational turn handled purely by the Gemini agent."""
+    """Single conversational turn handled by the OpenAI agent."""
     incoming_message = message or ""
     if not isinstance(profile.notes, dict):
         profile.notes = {}
@@ -1501,8 +1447,8 @@ def stepAgent(profile: Profile, message: str) -> Profile:
     if not _LLM:
         print("stepAgent aborting: LLM stack not ready.")
         raise RuntimeError(
-            "Gemini chat agent is not configured. "
-            "Set GOOGLE_API_KEY / GEMINI_MODEL and restart the backend."
+            "OpenAI chat agent is not configured. "
+            "Set OPENAI_API_KEY / OPENAI_MODEL and restart the backend."
         )
 
     if not has_prev_turns and not incoming_message.strip():
@@ -1515,10 +1461,35 @@ def stepAgent(profile: Profile, message: str) -> Profile:
         )
         return profile
 
-    # Build prompt focusing on LLM-driven flow (assistant_reply + fenced profile block)
+    # Build conversation context
     history_text = _format_history_for_prompt(notes.get("chat_history"))
     current_profile_json = _profile_json_for_prompt(profile)
     user_msg = incoming_message.strip()
+    
+    # Determine what's already answered and what's missing
+    missing_fields = _missing_fields(profile)
+    answered_fields = []
+    if profile.preferred_climates:
+        answered_fields.append("climate")
+    if profile.transit_min_score is not None:
+        answered_fields.append("transit")
+    if profile.safety_min_score is not None:
+        answered_fields.append("safety")
+    if profile.healthcare_min_score is not None:
+        answered_fields.append("healthcare")
+    if profile.education_min_score is not None:
+        answered_fields.append("education")
+    if profile.economy_score_min is not None:
+        answered_fields.append("economy")
+    if profile.population_min is not None:
+        answered_fields.append("population")
+    if profile.budget_monthly_usd is not None:
+        answered_fields.append("budget")
+    if _extract_note_option(profile, "arts"):
+        answered_fields.append("arts")
+    if _extract_note_option(profile, "recreation"):
+        answered_fields.append("recreation")
+    
     prompt = (
         "You are Compass, a professional yet warm US relocation assistant.\n"
         "On each turn you must:\n"
@@ -1537,11 +1508,32 @@ def stepAgent(profile: Profile, message: str) -> Profile:
         "budget: <monthly housing USD number or blank>\n"
         "next_question: <one concise follow-up for the most important missing field>\n"
         "```\n"
-        "Rules:\n"
+        "\n"
+        "ALREADY ANSWERED FIELDS (DO NOT ask about these again):\n"
+        f"{', '.join(answered_fields) if answered_fields else 'None'}\n"
+        "\n"
+        "MISSING FIELDS (only ask about these):\n"
+        f"{', '.join(missing_fields) if missing_fields else 'None - profile is complete!'}\n"
+        "\n"
+        "CRITICAL CONVERSION RULES:\n"
+        "- Safety scores are INVERTED: lower numbers mean SAFER. 'very safe'/'feel safe walking'/'safe walking around at all times' = 2.0, NOT 10.0\n"
+        "- Transit: 'walk around everywhere'/'walkable'/'walking'/'want to walk around' = 8.0-9.0, 'car dependent' = 2.5\n"
+        "- Education: 'no preferences'/'graduated'/'not important'/'no priorities' = 1.0, NOT 0.0\n"
+        "- Healthcare: 'good quality healthcare'/'good access'/'need good healthcare' = 7.0, 'excellent' = 8.5, 'average' = 5.0\n"
+        "- Economy: 'steady' = 6.0, 'strong' = 7.5, 'booming' = 9.0, 'weak' = 3.0\n"
+        "- Population: When user mentions a city name (e.g., 'columbus ohio', 'new york', 'chicago'), use your knowledge to convert it to the approximate population number. For example, Columbus Ohio ≈ 900000, New York City ≈ 8000000, Chicago ≈ 2700000. Also accept qualitative terms: 'small town' ≈ 50000, 'mid-size' ≈ 200000, 'big city' ≈ 1000000\n"
+        "\n"
+        "CONVERSATION RULES:\n"
+        "- Ask questions naturally and conversationally. NEVER ask 'on a scale from 0 to 10' unless the answer is unclear.\n"
+        "- Ask ONE question about ONE missing field at a time. NEVER combine multiple fields.\n"
+        "- If user already answered a question (even if you didn't extract it perfectly), do NOT ask the same question again. Move to the next missing field.\n"
+        "- When user answers, immediately convert their response using the conversion rules above.\n"
+        "- Only ask about fields in MISSING FIELDS. Never ask about fields in ALREADY ANSWERED FIELDS.\n"
         "- Keep numbers 0–10 where applicable; you may infer decimals up to 15 places but keep the string short.\n"
         "- Population is numeric (e.g., 1000000 for a big city). Budget is numeric USD (accept $ or commas in user text, output plain number).\n"
         "- If you cannot infer a field, leave it blank. Do not invent extra keys. Always include next_question.\n"
-        "- Stay concise; no extra fences or commentary. The user-facing reply must stay outside the fenced block. Always end with a question to the user, never end with a statement and only about the fields stated above nothing else, stick to the script.\n\n"
+        "- Stay concise; no extra fences or commentary. The user-facing reply must stay outside the fenced block.\n"
+        "\n"
         f"HISTORY (recent):\n{history_text}\n\n"
         f"CURRENT_PROFILE_JSON:\n{current_profile_json}\n\n"
         f"LATEST_USER_MESSAGE:\n{user_msg or 'None'}\n"
@@ -1558,6 +1550,26 @@ def stepAgent(profile: Profile, message: str) -> Profile:
 
     assistant_reply, parsed_block = _parse_llm_profile_block(llm_output_text)
     _apply_parsed_profile(profile, parsed_block)
+    
+    # Post-processing: Fix common LLM conversion errors
+    msg_lower = user_msg.lower()
+    
+    # Fix transit: "walk around everywhere" should be high (8-9), not 0
+    if "walk" in msg_lower and ("everywhere" in msg_lower or "around" in msg_lower or "walkable" in msg_lower or "want to walk" in msg_lower):
+        if profile.transit_min_score is None or profile.transit_min_score < 5.0:
+            profile.transit_min_score = 8.5
+    
+    # Fix safety: "feel safe" should be LOW (2.0), not high (10.0) - safety is INVERTED
+    if "safe" in msg_lower and ("walk" in msg_lower or "all times" in msg_lower or "anytime" in msg_lower or "walking around" in msg_lower):
+        if profile.safety_min_score is None or profile.safety_min_score > 5.0:
+            profile.safety_min_score = 2.0
+    
+    # Fix education: "no preferences" or "graduated" should be 1.0, not 0.0
+    if ("no preferences" in msg_lower or "graduated" in msg_lower or "no priority" in msg_lower or "not important" in msg_lower):
+        last_q_lower = (notes.get("_last_question") or "").lower()
+        if "education" in last_q_lower or profile.education_min_score == 0.0:
+            if profile.education_min_score is None or profile.education_min_score == 0.0:
+                profile.education_min_score = 1.0
     
     # Explicit check: if user said "no priorities" or "none" about education and it's not set
     if profile.education_min_score is None:
@@ -1708,14 +1720,15 @@ def _post_update_heuristics(profile: Profile, message: str, has_prev_turns: bool
             except Exception:
                 pass
 
-    # Population from qualitative hints
+    # Population from qualitative hints only (city names should be handled by LLM's knowledge)
     if profile.population_min is None:
         pop_val = None
-        if "big city" in m or "metropolis" in m or "large city" in m:
+        # Only handle qualitative terms, not specific city names
+        if "big city" in m or "metropolis" in m or "large city" in m or "major city" in m:
             pop_val = 1_000_000
-        elif "mid" in m or "medium city" in m or "mid-size" in m:
+        elif "mid" in m or "medium city" in m or "mid-size" in m or "mid-sized" in m or "medium-sized" in m:
             pop_val = 200_000
-        elif "small town" in m or "small city" in m:
+        elif "small town" in m or "small city" in m or "rural" in m:
             pop_val = 50_000
         pop_note = None
         try:
@@ -1724,9 +1737,9 @@ def _post_update_heuristics(profile: Profile, message: str, has_prev_turns: bool
             pop_note = None
         if isinstance(pop_note, str):
             pn = pop_note.lower()
-            if "large" in pn or "big" in pn:
+            if "large" in pn or "big" in pn or "major" in pn:
                 pop_val = pop_val or 1_000_000
-            elif "mid" in pn:
+            elif "mid" in pn or "medium" in pn:
                 pop_val = pop_val or 200_000
             elif "small" in pn:
                 pop_val = pop_val or 50_000

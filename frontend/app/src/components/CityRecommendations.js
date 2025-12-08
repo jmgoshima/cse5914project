@@ -253,55 +253,94 @@ const CityRecommendations = ({
             city.region ||
             city.state_code ||
             "";
-          const queryValue = [cityName, stateName]
-            .filter(Boolean)
-            .join(", ")
+          
+          // Clean up city name: remove hyphens, extra state codes, etc.
+          const cleanCityName = cityName
+            .replace(/-/g, " ") // Replace hyphens with spaces
+            .replace(/,.*$/, "") // Remove everything after comma (e.g., "DC-MD-VA" part)
+            .replace(/\s+/g, " ") // Normalize whitespace
             .trim();
-          const finalQuery =
-            queryValue || cityName || stateName || "city skyline";
-
-          if (!finalQuery) {
-            updates[identifier] = null;
-            return;
+          
+          // Clean up state name: take only the first state if multiple
+          const cleanStateName = stateName
+            .split(",")[0] // Take first state if comma-separated
+            .split("-")[0] // Take first state if hyphen-separated
+            .trim();
+          
+          // Build query options to try (in order of preference)
+          const queryOptions = [];
+          if (cleanCityName && cleanStateName) {
+            queryOptions.push(`${cleanCityName} ${cleanStateName}`);
+            queryOptions.push(`${cleanCityName}, ${cleanStateName}`);
           }
+          if (cleanCityName) {
+            queryOptions.push(cleanCityName);
+            queryOptions.push(`${cleanCityName} city`);
+          }
+          if (cleanStateName) {
+            queryOptions.push(`${cleanStateName} city`);
+          }
+          queryOptions.push("city skyline"); // Fallback
 
           if (!UNSPLASH_ACCESS_KEY) {
-            console.warn(`Unsplash access key not configured for city: ${finalQuery}`);
+            console.warn(`Unsplash access key not configured`);
             updates[identifier] = null;
             return;
           }
 
-          const url = new URL(UNSPLASH_BASE_URL);
-          url.searchParams.set("query", finalQuery);
-          url.searchParams.set("per_page", "1");
-          url.searchParams.set("orientation", "landscape");
+          // Try each query option until we find an image
+          let imageUrl = null;
+          for (const query of queryOptions) {
+            try {
+              const url = new URL(UNSPLASH_BASE_URL);
+              url.searchParams.set("query", query);
+              url.searchParams.set("per_page", "1");
+              url.searchParams.set("orientation", "landscape");
 
-          try {
-            const response = await fetch(url.toString(), {
-              headers: {
-                Authorization: `Client-ID ${UNSPLASH_ACCESS_KEY}`,
-                "Accept-Version": "v1",
-              },
-            });
+              const response = await fetch(url.toString(), {
+                headers: {
+                  Authorization: `Client-ID ${UNSPLASH_ACCESS_KEY}`,
+                  "Accept-Version": "v1",
+                },
+              });
 
-            if (!response.ok) {
-              console.error(`Unsplash API error for "${finalQuery}": ${response.status} ${response.statusText}`);
-              updates[identifier] = null;
-              return;
+              if (!response.ok) {
+                continue; // Try next query
+              }
+
+              const payload = await response.json();
+              
+              // Check multiple possible response structures
+              const results = payload?.results || payload?.data || [];
+              if (Array.isArray(results) && results.length > 0) {
+                const firstResult = results[0];
+                imageUrl = 
+                  firstResult?.urls?.regular || 
+                  firstResult?.urls?.small || 
+                  firstResult?.urls?.thumb ||
+                  firstResult?.url ||
+                  firstResult?.image_url ||
+                  null;
+                
+                if (imageUrl) {
+                  break; // Found an image, stop trying
+                }
+              }
+            } catch (err) {
+              // Continue to next query option
+              continue;
             }
-
-            const payload = await response.json();
-            const imageUrl = payload?.results?.[0]?.urls?.regular || null;
-            
-            if (!imageUrl) {
-              console.warn(`No image found in Unsplash response for: ${finalQuery}`, payload);
-            }
-
-            updates[identifier] = imageUrl;
-          } catch (err) {
-            console.error(`Failed to fetch Unsplash image for "${finalQuery}":`, err);
-            updates[identifier] = null;
           }
+          
+          if (!imageUrl) {
+            console.warn(`No image found for city: ${cleanCityName || cityName}`, {
+              triedQueries: queryOptions,
+              originalCity: cityName,
+              originalState: stateName,
+            });
+          }
+
+          updates[identifier] = imageUrl;
         })
       );
 
