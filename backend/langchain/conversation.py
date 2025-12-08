@@ -1658,6 +1658,30 @@ def stepAgent(profile: Profile, message: str) -> Profile:
     notes["next_question"] = None if ready else next_q
     notes["_last_question"] = None if ready else next_q
 
+    # Prevent asking the same question that was just asked
+    if next_q and notes.get("_last_question") and next_q.lower().strip() == notes.get("_last_question").lower().strip():
+        # If it's the same question, move to next missing field
+        if missing:
+            field_order = ["climate", "transit", "safety", "healthcare", "education", "arts", "recreation", "economy", "population", "budget"]
+            for f in field_order:
+                if f in missing:
+                    field_labels = {
+                        "climate": "climate preference",
+                        "transit": "transportation and walkability",
+                        "safety": "safety expectations",
+                        "healthcare": "healthcare needs",
+                        "education": "education priorities",
+                        "arts": "arts and culture scene",
+                        "recreation": "recreation and outdoors",
+                        "economy": "economy and job market",
+                        "population": "city size",
+                        "budget": "housing budget",
+                    }
+                    next_q = f"What are your preferences for {field_labels.get(f, f)}?"
+                    notes["next_question"] = next_q
+                    notes["_last_question"] = next_q
+                    break
+
     # response shown to user
     if ready:
         notes["response"] = assistant_reply or "Thanks! I have what I need. Let me fetch recommendations."
