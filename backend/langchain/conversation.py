@@ -136,7 +136,7 @@ _CONVERSATIONAL_FIELD_PROMPTS = {
     "safety": "Tell me about the level of safety that would make you feel at ease day to day.",
     "healthcare": "How close or high-quality do you need healthcare options to be?",
     "education": "Are nearby schools, universities, or learning hubs important for you or your household?",
-    "arts": "Paint me a picture of the arts and culture vibe you’d love—live music, galleries, theaters, or something else entirely?",
+    "arts": "Paint me a picture of the arts and culture vibe you'd love—live music, galleries, theaters, or something else entirely?",
     "recreation": "What kind of outdoor or recreation energy fits you best—endless trails, beaches, parks, or low-key green spaces?",
     "economy": "When you think about the local economy, are you drawn to booming job markets, steady stability, or a relaxed pace?",
     "population": "Awesome! For city size, do you imagine a massive metropolis, something mid-sized, or a more intimate community?",
@@ -1558,6 +1558,20 @@ def stepAgent(profile: Profile, message: str) -> Profile:
 
     assistant_reply, parsed_block = _parse_llm_profile_block(llm_output_text)
     _apply_parsed_profile(profile, parsed_block)
+    
+    # Explicit check: if user said "no priorities" or "none" about education and it's not set
+    if profile.education_min_score is None:
+        msg_lower = user_msg.lower()
+        last_q_lower = (notes.get("_last_question") or "").lower()
+        if ("education" in last_q_lower or "priorities" in last_q_lower) and (
+            "no priorities" in msg_lower or 
+            msg_lower.strip() in ["none", "no"] or
+            "not a priority" in msg_lower or
+            "don't care" in msg_lower
+        ):
+            profile.education_min_score = 1.0
+            if isinstance(profile.notes, dict):
+                profile.notes["education"] = "not important"
 
     # Lightweight deterministic inference as a safety net
     _capture_qualitative_answers(profile, user_msg)
@@ -1585,9 +1599,49 @@ def stepAgent(profile: Profile, message: str) -> Profile:
     notes["ready"] = ready
 
     next_q = parsed_block.get("next_question") if isinstance(parsed_block, dict) else None
+    
+    # Validate that next_question only asks about one field
+    if next_q:
+        # Check if question mentions multiple fields (common patterns)
+        next_q_lower = next_q.lower()
+        field_mentions = []
+        for field in ["climate", "transit", "safety", "healthcare", "education", "arts", "recreation", "economy", "population", "budget"]:
+            if field in next_q_lower:
+                field_mentions.append(field)
+        
+        # If multiple fields mentioned, regenerate question for just the first missing field
+        if len(field_mentions) > 1:
+            next_q = None  # Force regeneration
+    
+    # If no valid question or question asks about multiple fields, generate one for the first missing field
     if not next_q and not ready and missing:
-        field = "budget" if "budget" in missing else missing[0]
-        next_q = _question_for_key(field) or "Can you tell me a bit more?"
+        # Use the field order to pick the first missing field
+        field_order = ["climate", "transit", "safety", "healthcare", "education", "arts", "recreation", "economy", "population", "budget"]
+        # Find first missing field in order
+        field = None
+        for f in field_order:
+            if f in missing:
+                field = f
+                break
+        # Fallback to first missing if not in order
+        if not field:
+            field = "budget" if "budget" in missing else missing[0]
+        
+        # Generate a simple question for this ONE field
+        field_labels = {
+            "climate": "climate preference",
+            "transit": "transportation and walkability",
+            "safety": "safety expectations",
+            "healthcare": "healthcare needs",
+            "education": "education priorities",
+            "arts": "arts and culture scene",
+            "recreation": "recreation and outdoors",
+            "economy": "economy and job market",
+            "population": "city size",
+            "budget": "housing budget",
+        }
+        label = field_labels.get(field, field)
+        next_q = f"What are your preferences for {label}?"
 
     notes["next_question"] = None if ready else next_q
     notes["_last_question"] = None if ready else next_q
@@ -1598,11 +1652,25 @@ def stepAgent(profile: Profile, message: str) -> Profile:
         notes.pop("pending_fields", None)
         notes.pop("next_action", None)
     else:
-        # Prefer to show both the assistant reply and the next question so the user knows what to answer.
-        if assistant_reply and next_q:
-            notes["response"] = f"{assistant_reply} {next_q}"
+        # Show the assistant's natural reply (which should include the question)
+        # If LLM included question in assistant_reply, check it only asks about one thing
+        if assistant_reply:
+            # If assistant_reply already contains a question, use it
+            # But validate it doesn't ask about multiple fields
+            assistant_lower = assistant_reply.lower()
+            field_count = sum(1 for f in ["climate", "transit", "safety", "healthcare", "education", "arts", "recreation", "economy", "population", "budget"] if f in assistant_lower)
+            
+            if field_count <= 1 and next_q and next_q not in assistant_reply:
+                # Assistant reply is good, append the next question if it's separate
+                notes["response"] = f"{assistant_reply} {next_q}"
+            elif field_count <= 1:
+                # Assistant reply is good and already has the question
+                notes["response"] = assistant_reply
+            else:
+                # Assistant reply asks about multiple fields, use just the next_q
+                notes["response"] = next_q or assistant_reply
         else:
-            notes["response"] = assistant_reply or next_q or "Can you share a bit more?"
+            notes["response"] = next_q or "Can you share a bit more about what you're looking for?"
         if missing:
             notes["pending_fields"] = [f for f in missing if f != "budget"]
 
@@ -1713,6 +1781,26 @@ def _post_update_heuristics(profile: Profile, message: str, has_prev_turns: bool
                         if val not in profile.preferred_climates:
                             profile.preferred_climates.append(val)
                         break
+            # Handle education negative responses
+            if "education" in last_q or "school" in last_q:
+                m_lower = msg_clean.lower()
+                # Check for negative/not important responses
+                neg_phrases = [
+                    "not important", "not a priority", "not at all", 
+                    "no", "none", "less of a priority", "don't care", "none" 
+                    "dont care", "wouldn't say", "wouldnt say", 
+                    "dont really need", "don't really need",
+                    "not really", "not really need", "dont need", "don't need"
+                ]
+                if any(phrase in m_lower for phrase in neg_phrases):
+                    if profile.education_min_score is None:
+                        profile.education_min_score = 1.0
+                # Also try qualitative mapping as fallback
+                elif profile.education_min_score is None:
+                    from backend.search.qualitative import qualitative_to_numeric
+                    qscore = qualitative_to_numeric("Educ", msg_clean)
+                    if qscore is not None:
+                        profile.education_min_score = qscore
 
 
 def _apply_answer_from_last_question(profile: Profile, notes: Dict[str, Any], last_q: str, message: str) -> bool:

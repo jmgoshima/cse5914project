@@ -373,7 +373,11 @@ def create_app() -> Flask:
         }
 
         # Optionally trigger recommendation when ready
-        if payload["ready"]:
+        # Double-check readiness using is_profile_ready to prevent premature calls
+        from backend.langchain.conversation import is_profile_ready
+        is_actually_ready = is_profile_ready(updated_profile)
+        
+        if payload["ready"] and is_actually_ready:
             _publish_event(conversation_id, "status", {"stage": "searching"})
             try:
                 rec = _recommend_for_profile(updated_profile, top_k=10, take=5, index=app.config["ES_INDEX_DEFAULT"])
@@ -381,6 +385,9 @@ def create_app() -> Flask:
                 _publish_event(conversation_id, "status", {"stage": "results_ready"})
             except RuntimeError as e:
                 return err("Elasticsearch query failed.", 502, {"reason": str(e)})
+        else:
+            # Ensure ready flag matches actual state
+            payload["ready"] = is_actually_ready
 
         return ok(payload)
 

@@ -266,6 +266,7 @@ const CityRecommendations = ({
           }
 
           if (!UNSPLASH_ACCESS_KEY) {
+            console.warn(`Unsplash access key not configured for city: ${finalQuery}`);
             updates[identifier] = null;
             return;
           }
@@ -284,15 +285,21 @@ const CityRecommendations = ({
             });
 
             if (!response.ok) {
+              console.error(`Unsplash API error for "${finalQuery}": ${response.status} ${response.statusText}`);
               updates[identifier] = null;
               return;
             }
 
             const payload = await response.json();
             const imageUrl = payload?.results?.[0]?.urls?.regular || null;
+            
+            if (!imageUrl) {
+              console.warn(`No image found in Unsplash response for: ${finalQuery}`, payload);
+            }
 
             updates[identifier] = imageUrl;
           } catch (err) {
+            console.error(`Failed to fetch Unsplash image for "${finalQuery}":`, err);
             updates[identifier] = null;
           }
         })
