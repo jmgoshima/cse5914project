@@ -98,9 +98,3 @@ npm start
 - Elasticsearch client: This repo expects an Elasticsearch 8+ client API; if you use OpenSearch please update the client import and pins.
 - If LLM requests fail with `OPENAI_API_KEY` not set, the code falls back to deterministic stubs for local development.
 - If you run into import or version errors, try creating a fresh virtualenv and reinstalling pinned deps.
-
-## Next steps I can help with
-
-- Rename `backend/utils/ cache.py` to `backend/utils/cache.py` and update imports.
-- Add a small smoke script to run an end-to-end query through the loader -> query -> explain flow (requires an ES instance).
-- Add CI workflow to run tests on push.
