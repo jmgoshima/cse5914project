@@ -13,43 +13,75 @@ This repo contains a small backend that combines a retrieval layer (Elasticsearc
 
 These are the basic steps to get a developer environment running on Windows PowerShell.
 
-1. Create and activate a virtual environment
+Follow the steps below to run Elasticsearch, the backend, and the frontend simultaneously using three separate terminals.
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
+***Terminal 1 – Start Elasticsearch***
 
-2. Install pinned dependencies
+Start Docker Desktop.
 
-```powershell
+Open a terminal and navigate to the project root:
+cd <project-root>
+
+Remove any existing Elasticsearch container:
+docker rm -f places-es
+
+Start Elasticsearch:
+docker run -d --name places-es -p 9200:9200 -p 9300:9300 -e "discovery.type=single-node" -e "xpack.security.enabled=false" docker.elastic.co/elasticsearch/elasticsearch:8.11.1
+
+Monitor logs to confirm it started correctly:
+docker logs -f places-es
+
+***Terminal 2 – Backend Setup and Launch***
+
+Open a new terminal and navigate to the project root:
+cd <project-root>
+
+Deactivate any existing Python environment:
+if (Get-Command deactivate -ErrorAction SilentlyContinue) { deactivate }
+
+Remove the existing virtual environment:
+if (Test-Path .venv) { Remove-Item -Recurse -Force .venv }
+
+Create a fresh virtual environment:
+py -3.11 -m venv .venv
+
+Allow script execution for this session:
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+Activate the environment:
+..venv\Scripts\Activate.ps1
+
+Upgrade pip and install dependencies:
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-```
 
-3. Environment variables (examples)
+Set backend environment variables:
+$env:MPLBACKEND = 'Agg'
+$env:ELASTICSEARCH_URL = 'http://localhost:9200
+'
+$env:ES_INDEX = 'cities'
+$env:ES_LOCAL_PASSWORD = '<your-elasticsearch-password>'
+$env:OPENAI_API_KEY = '<your-openai-api-key>'
 
-```powershell
-$env:ELASTICSEARCH_URL = 'http://localhost:9200'
-$env:ES_INDEX = 'us_cities'
-$env:OPENAI_API_KEY = 'sk-xxxx'    # only if you want LLM features
-$env:ENV = 'development'
-```
+Load the Elasticsearch index:
+python -m backend.search.loader
 
-4. Run the backend
-
-This repo's backend uses Flask in a factory pattern. Run using Python directly (development):
-
-```powershell
-# run via flask if FLASK_APP is configured or invoke the module directly
+Start the backend service:
 python -m backend.app
-# or, if you prefer uvicorn for ASGI wrappers, adapt as needed
-```
 
-5. Run tests
+***Terminal 3 – Frontend Setup and Launch***
 
-```powershell
-pytest -q
-```
+Open a third terminal and navigate to the frontend folder:
+cd <project-root>/frontend/app
+
+Allow script execution for this session:
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+Install Node dependencies:
+npm install
+
+Start the frontend development server:
+npm start
 
 ## Important files
 
