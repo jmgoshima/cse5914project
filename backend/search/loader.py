@@ -1,17 +1,35 @@
-from elasticsearch import Elasticsearch, helpers
+from elasticsearch import helpers
 from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from dotenv import load_dotenv
 import os
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
+from backend.search.es_client import get_client  # type: ignore
 
 # 0. load .env variables from elastic-start-local
 
 env_path_relative = Path(__file__).parent.parent.parent / "elastic-start-local" / ".env"
 load_dotenv(dotenv_path=env_path_relative)
+# Propagate local creds to the standard vars expected by the client
+if not os.getenv("ES_PASSWORD") and os.getenv("ES_LOCAL_PASSWORD"):
+    os.environ["ES_PASSWORD"] = os.getenv("ES_LOCAL_PASSWORD")
+if not os.getenv("ES_USERNAME") and os.getenv("ES_LOCAL_USER"):
+    os.environ["ES_USERNAME"] = os.getenv("ES_LOCAL_USER")
 
 # 1. Clean and Normalize Data
+
+# Load the original data set, adjust the housing coust to be monthly housing cost, then save as places.csv
+df = pd.read_csv(Path(__file__).parent / "data" / "places_og.csv")
+df['HousingCost'] = df['HousingCost'] / 12
+
+df.to_csv(Path(__file__).parent / "data" / "places.csv", index=False)
 
 # Load data as a dataframe
 df = pd.read_csv(Path(__file__).parent / "data" / "places.csv")
@@ -34,40 +52,30 @@ numerical_cols = df.select_dtypes(include=['number']).columns
 
 # Initialize Scalers
 min_max_scaler = MinMaxScaler((low_num, high_num))
-z_score_scaler = StandardScaler()
+# z_score_scaler = StandardScaler()
 
 # Apply Min-Max Scaling to numerical columns
 min_max_df = df.copy()
 min_max_df[numerical_cols] = min_max_scaler.fit_transform(df[numerical_cols])
 
 # Apply z-score normalization to numerical columns
-z_score_df = df.copy()
-z_score_df[numerical_cols] = z_score_scaler.fit_transform(df[numerical_cols])
+# z_score_df = df.copy()
+# z_score_df[numerical_cols] = z_score_scaler.fit_transform(df[numerical_cols])
 
 
 print(min_max_df.head(10))
-print(z_score_df.head(10))
+# print(z_score_df.head(10))
 
 min_max_df.to_csv(Path(__file__).parent / "data" / "places_min_max.csv", index=False)
-z_score_df.to_csv(Path(__file__).parent / "data" / "places_z_score.csv", index=False)
+# z_score_df.to_csv(Path(__file__).parent / "data" / "places_z_score.csv", index=False)
 
 
 # 2. Loading data into elastic search
-#df = pd.read_csv("data/places.csv")
-index_name = "us_cities"
-es = Elasticsearch('http://localhost:9200', basic_auth=('elastic', os.getenv("ES_LOCAL_PASSWORD")), verify_certs=False)
-
-# # prepare bulk actions
-# actions = [
-#     {
-#         "_index": index_name,
-#         "_source": row.to_dict()
-#     }
-#     for _, row in z_score_df.iterrows()
-# ]
+index_name = "cities"
+es = get_client()
 
 # Define mapping for the index
-dims = len(z_score_df.columns) - 1  # exclude "City" column
+dims = len(min_max_df.columns) - 1  # exclude "City" column
 mapping = {
     "mappings": {
         "properties": {
@@ -85,7 +93,7 @@ es.indices.create(index=index_name, body=mapping)
 
 # Prepare bulk actions
 actions = []
-for _, row in z_score_df.iterrows():
+for _, row in min_max_df.iterrows():
     row_dict = row.to_dict()
     city_name = row_dict.pop("City")  # remove "City" from vector fields
     vector_values = list(row_dict.values())  # remaining numeric values

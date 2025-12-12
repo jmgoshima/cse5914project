@@ -6,3 +6,6 @@ elastic-start-local
 
 # ignore LLM .env
 .env
+
+# ignore __pycache__
+__pycache__/

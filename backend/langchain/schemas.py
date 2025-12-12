@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class Weights(BaseModel):
@@ -15,7 +15,7 @@ class Weights(BaseModel):
 class HardFilters(BaseModel):
     country: Optional[str] = None
     state: Optional[str] = None
-    min_population: Optional[int] = None
+    min_population: Optional[float] = None
     visa_required: Optional[bool] = None
 
 
@@ -45,7 +45,7 @@ class Profile(BaseModel):
 
     # Location and population
     location: Optional[Dict[str, float]] = None  # {'lat': float, 'lon': float}
-    population_min: Optional[int] = None
+    population_min: Optional[float] = None
 
     # Legacy / conversational fields (kept for backward compatibility)
     budget_monthly_usd: Optional[int] = None
@@ -62,3 +62,29 @@ class Profile(BaseModel):
 
     class Config:
         extra = "ignore"
+
+
+class ReasoningEntry(BaseModel):
+    """Single reasoning entry for a recommended city."""
+
+    model_config = ConfigDict(extra="allow")
+
+    city: Optional[str] = None
+    reason: Optional[str] = None
+    score: Optional[float] = None
+    id: Optional[str] = None
+    rank: Optional[int] = None
+
+
+class RecommendationResults(BaseModel):
+    """Container for nearest-neighbor / recommendation responses."""
+
+    model_config = ConfigDict(extra="allow")
+
+    header: Optional[str] = None
+    raw_output: Optional[str] = None
+    profile_payload: Optional[Dict[str, Any]] = None
+    reasoning: List[ReasoningEntry] = Field(default_factory=list)
+    command: Optional[List[str]] = None
+    stderr: Optional[str] = None
+    error: Optional[str] = None
