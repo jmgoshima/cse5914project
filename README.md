@@ -1,4 +1,4 @@
-Project: Places + LLM search backend
+# Project: Places + LLM search backend
 
 ## Overview
 
@@ -16,6 +16,8 @@ These are the basic steps to get a developer environment running on Windows Powe
 Follow the steps below to run Elasticsearch, the backend, and the frontend simultaneously using three separate terminals.
 
 ***Terminal 1 – Start Elasticsearch***
+
+Install a [local instance of elasticsearch here](https://www.elastic.co/docs/deploy-manage/deploy/self-managed/local-development-installation-quickstart)
 
 Start Docker Desktop.
 
